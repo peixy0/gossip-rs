@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use gossip_rs::event::*;
 use gossip_rs::node::{DefaultDependencyProvider, Node};
 use gossip_rs::timer;
@@ -13,56 +15,37 @@ async fn main() {
 
     info!("Starting Raft voting simulation...");
 
-    let num_nodes: usize = 4;
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
-    let mut nodes = vec![];
+    let num_nodes: u64 = 4;
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Outbound)>();
+    let mut nodes = HashMap::new();
     let mut futs = vec![];
     let timer_service = timer::DefaultTimerService;
     for node_id in 1..=num_nodes {
         let (node, join) = Node::<DefaultDependencyProvider>::new(
-            node_id as u64,
+            node_id,
+            num_nodes,
             outbound_tx.clone(),
             timer_service.clone(),
             num_nodes / 2 + 1,
         );
-        nodes.push((node_id as u64, node));
+        nodes.insert(node_id, node);
         futs.push(join.wait());
     }
 
     tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            if rand::random_range(0.0..1.0) < 0.3 {
-                warn!("Dropping {:?}", msg);
-                continue;
-            }
+        while let Some((recipient, msg)) = outbound_rx.recv().await {
             match msg {
                 Outbound::RequestVote(e) => {
-                    for (node_id, node) in &nodes {
-                        if *node_id != e.candidate_id {
-                            node.recv(e.clone());
-                        }
-                    }
+                    nodes.get(&recipient).unwrap().recv(e);
                 }
-                Outbound::Vote(recipient, e) => {
-                    for (node_id, node) in &nodes {
-                        if *node_id == recipient {
-                            node.recv(e.clone());
-                        }
-                    }
+                Outbound::Vote(e) => {
+                    nodes.get(&recipient).unwrap().recv(e);
                 }
                 Outbound::AppendEntries(e) => {
-                    for (node_id, node) in &nodes {
-                        if *node_id != e.leader_id {
-                            node.recv(e.clone());
-                        }
-                    }
+                    nodes.get(&recipient).unwrap().recv(e);
                 }
-                Outbound::AppendEntriesResponse(recipient, e) => {
-                    for (node_id, node) in &nodes {
-                        if *node_id == recipient {
-                            node.recv(e.clone());
-                        }
-                    }
+                Outbound::AppendEntriesResponse(e) => {
+                    nodes.get(&recipient).unwrap().recv(e);
                 }
             }
         }
