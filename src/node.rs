@@ -41,6 +41,7 @@ pub trait DependencyProvider {
     type TimerService: timer::TimerService + Send;
 }
 
+#[derive(Clone)]
 pub struct DefaultDependencyProvider;
 
 impl DependencyProvider for DefaultDependencyProvider {
@@ -131,6 +132,7 @@ trait OnEvent<T> {
 struct Runner<Provider: DependencyProvider> {
     node_id: u64,
     num_nodes: u64,
+    leader_id: Option<u64>,
     rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     internal_tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<(u64, Outbound)>,
@@ -173,6 +175,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         Self {
             node_id,
             num_nodes,
+            leader_id: None,
             rx,
             internal_tx,
             outbound_tx,
@@ -243,6 +246,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     fn become_follower(&mut self, term: u64) {
         let prev_role = self.role;
         self.role = Role::Follower;
+        self.leader_id = None;
         self.current_term = term;
         self.voted_for = None;
         self.stop_heartbeat_timers();
@@ -272,6 +276,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     fn become_candidate(&mut self) {
         let prev_role = self.role;
         self.role = Role::Candidate;
+        self.leader_id = None;
         self.current_term += 1;
         self.voted_for = Some(self.node_id);
         self.votes_collected.clear();
@@ -287,6 +292,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     fn become_leader(&mut self) {
         let prev_role = self.role;
         self.role = Role::Leader;
+        self.leader_id = Some(self.node_id);
         self.next_index.clear();
         self.match_index.clear();
         self.stop_election_timer();
@@ -350,6 +356,12 @@ impl<Provider: DependencyProvider> OnEvent<MakeRequest> for Runner<Provider> {
     fn on_event(&mut self, event: MakeRequest) {
         debug!("[Node {}] <- {:?}", self.node_id, event);
         if self.role != Role::Leader {
+            if let Some(leader_id) = self.leader_id {
+                debug!("[Node {}] forward to leader", self.node_id);
+                self.send_to(leader_id, event);
+            } else {
+                debug!("[Node {}] leader not elected", self.node_id);
+            }
             return;
         }
         self.log.push(LogEntry {
@@ -423,45 +435,31 @@ impl<Provider: DependencyProvider> OnEvent<RequestVote> for Runner<Provider> {
             return;
         }
 
+        let mut election_timer_restarted = false;
+        if event.term > self.current_term {
+            self.become_follower(event.term);
+            election_timer_restarted = true;
+        }
+
         let last_log_index = self.get_last_log_index();
         let last_log_term = self.get_log_term(last_log_index);
-        if event.last_log_term < last_log_term
-            || (event.last_log_term == last_log_term && event.last_log_index < last_log_index)
-        {
-            debug!(
-                "[Node {}] rejecting event, log entries not up to date",
-                self.node_id
-            );
-            let reply = Vote {
-                term: self.current_term,
-                voter_id: self.node_id,
-                granted: false,
-            };
-            self.send_to(event.candidate_id, reply);
-            return;
-        }
+        let log_ok = event.last_log_term > last_log_term
+            || (event.last_log_term == last_log_term && event.last_log_index >= last_log_index);
 
-        if event.term > self.current_term {
-            self.current_term = event.term;
-            self.voted_for = None;
-            self.role = Role::Follower;
+        let grant_vote =
+            log_ok && (self.voted_for.is_none() || self.voted_for == Some(event.candidate_id));
+        if grant_vote {
+            self.voted_for = Some(event.candidate_id);
+            if !election_timer_restarted {
+                self.start_election_timer();
+            }
         }
-
-        let grant_vote = match self.voted_for {
-            None => true,
-            Some(v) => v == event.candidate_id,
-        };
 
         let reply = Vote {
             term: self.current_term,
             voter_id: self.node_id,
             granted: grant_vote,
         };
-
-        if grant_vote {
-            self.voted_for = Some(event.candidate_id);
-            self.start_election_timer();
-        }
 
         self.send_to(event.candidate_id, reply);
     }
@@ -510,15 +508,6 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
     fn on_event(&mut self, event: AppendEntries) {
         debug!("[Node {}] <- {:?}", self.node_id, event);
 
-        if event.term > self.current_term {
-            info!(
-                "[Node {}] term {} > current_term {}",
-                self.node_id, event.term, self.current_term
-            );
-            self.become_follower(event.term);
-            return;
-        }
-
         if event.term < self.current_term {
             debug!(
                 "[Node {}] dropping event, term {} < current_term {}",
@@ -551,11 +540,8 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             return;
         }
 
-        self.log.truncate(event.prev_log_index as usize);
-        self.log.extend(event.entries.into_iter());
-
-        self.commit_index = std::cmp::max(self.commit_index, event.leader_commit);
-        self.advance_commit_index();
+        self.current_term = event.term;
+        self.leader_id = Some(event.leader_id);
 
         match self.role {
             Role::Leader | Role::Candidate => {
@@ -569,6 +555,12 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
                 self.start_election_timer();
             }
         }
+
+        self.log.truncate(event.prev_log_index as usize);
+        self.log.extend(event.entries.into_iter());
+
+        self.commit_index = std::cmp::max(self.commit_index, event.leader_commit);
+        self.advance_commit_index();
 
         let resp = AppendEntriesResponse {
             node_id: self.node_id,
@@ -613,7 +605,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
             self.try_advance_commit_index();
         } else {
             self.next_index.entry(event.node_id).and_modify(|idx| {
-                *idx -= std::cmp::min(*idx, 10);
+                *idx = idx.checked_sub(10).unwrap_or_default().max(1);
             });
         }
     }

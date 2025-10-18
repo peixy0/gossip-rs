@@ -44,10 +44,17 @@ pub struct AppendEntriesResponse {
 
 #[derive(Debug)]
 pub enum Outbound {
+    MakeRequest(MakeRequest),
     RequestVote(RequestVote),
     Vote(Vote),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
+}
+
+impl Into<Outbound> for MakeRequest {
+    fn into(self) -> Outbound {
+        Outbound::MakeRequest(self)
+    }
 }
 
 impl Into<Outbound> for RequestVote {
