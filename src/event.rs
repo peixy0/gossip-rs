@@ -5,6 +5,11 @@ pub struct LogEntry {
 }
 
 #[derive(Clone, Debug)]
+pub struct MakeRequest {
+    pub request: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct RequestVote {
     pub term: u64,
     pub candidate_id: u64,
@@ -31,7 +36,9 @@ pub struct AppendEntries {
 
 #[derive(Clone, Debug)]
 pub struct AppendEntriesResponse {
+    pub node_id: u64,
     pub term: u64,
+    pub prev_log_index: u64,
     pub success: bool,
 }
 

@@ -33,19 +33,35 @@ async fn main() {
     }
 
     tokio::spawn(async move {
-        while let Some((recipient, msg)) = outbound_rx.recv().await {
-            match msg {
-                Outbound::RequestVote(e) => {
-                    nodes.get(&recipient).unwrap().recv(e);
-                }
-                Outbound::Vote(e) => {
-                    nodes.get(&recipient).unwrap().recv(e);
-                }
-                Outbound::AppendEntries(e) => {
-                    nodes.get(&recipient).unwrap().recv(e);
-                }
-                Outbound::AppendEntriesResponse(e) => {
-                    nodes.get(&recipient).unwrap().recv(e);
+        loop {
+            tokio::select! {
+                e = outbound_rx.recv() => {
+                    if let Some((recipient, event)) = e {
+                        match event {
+                            Outbound::RequestVote(ev) => {
+                                if let Some(node) = nodes.get(&recipient) {
+                                    node.recv(ev);
+                                }
+                            }
+                            Outbound::Vote(ev) => {
+                                if let Some(node) = nodes.get(&recipient) {
+                                    node.recv(ev);
+                                }
+                            }
+                            Outbound::AppendEntries(ev) => {
+                                if let Some(node) = nodes.get(&recipient) {
+                                    node.recv(ev);
+                                }
+                            }
+                            Outbound::AppendEntriesResponse(ev) => {
+                                if let Some(node) = nodes.get(&recipient) {
+                                    node.recv(ev);
+                                }
+                            }
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
