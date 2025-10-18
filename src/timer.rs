@@ -1,9 +1,20 @@
 use tokio::time::Duration;
 use tracing::*;
 
-pub struct Timer(Option<tokio::sync::oneshot::Sender<()>>);
+pub trait Timer {}
 
-impl Drop for Timer {
+pub trait TimerService {
+    type Timer: Send;
+    fn create(
+        &self,
+        duration: Duration,
+        f: impl Future<Output = ()> + Send + 'static,
+    ) -> Self::Timer;
+}
+
+pub struct DefaultTimer(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DefaultTimer {
     fn drop(&mut self) {
         if let Some(tx) = self.0.take() {
             let _ = tx.send(());
@@ -11,8 +22,19 @@ impl Drop for Timer {
     }
 }
 
-impl Timer {
-    pub fn new(duration: Duration, f: impl Future<Output = ()> + Send + 'static) -> Self {
+impl Timer for DefaultTimer {}
+
+#[derive(Clone)]
+pub struct DefaultTimerService;
+
+impl TimerService for DefaultTimerService {
+    type Timer = DefaultTimer;
+
+    fn create(
+        &self,
+        duration: Duration,
+        f: impl Future<Output = ()> + Send + 'static,
+    ) -> Self::Timer {
         let marker = uuid::Uuid::new_v4();
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -27,6 +49,6 @@ impl Timer {
                 }
             }
         });
-        Self(Some(tx))
+        DefaultTimer(Some(tx))
     }
 }
