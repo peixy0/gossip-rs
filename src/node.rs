@@ -121,6 +121,13 @@ impl<Provider> Recv<MakeRequest> for Node<Provider> {
     }
 }
 
+#[cfg(test)]
+impl<Provider> Recv<Inbound> for Node<Provider> {
+    fn recv(&self, event: Inbound) {
+        let _ = self.tx.send(event);
+    }
+}
+
 trait EventLoop<Event> {
     async fn run_eventloop(self);
 }
@@ -146,6 +153,7 @@ struct Runner<Provider: DependencyProvider> {
     commit_index: u64,
     last_applied: u64,
 
+    next_backoff_index: HashMap<u64, u64>,
     next_index: HashMap<u64, u64>,
     match_index: HashMap<u64, u64>,
 
@@ -186,19 +194,22 @@ impl<Provider: DependencyProvider> Runner<Provider> {
             log: Vec::new(),
             commit_index: 0,
             last_applied: 0,
+            next_backoff_index: HashMap::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
             heartbeat_timeout_base_in_ms: 1000,
             heartbeat_timer: HashMap::new(),
-            election_timeout_base_in_ms: 3000,
+            election_timeout_base_in_ms: 5000,
             election_timer: None,
             votes_collected: HashSet::new(),
             quorum,
         }
     }
 
-    fn send_to(&self, node_id: u64, event: impl Into<Outbound>) {
-        let _ = self.outbound_tx.send((node_id, event.into()));
+    fn send_to(&self, peer_id: u64, event: impl Into<Outbound>) {
+        let msg = event.into();
+        debug!("[Node {}] -> [Node {}] {:?}", self.node_id, peer_id, msg);
+        let _ = self.outbound_tx.send((peer_id, msg));
     }
 
     fn get_last_log_index(&self) -> u64 {
@@ -250,7 +261,6 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         self.current_term = term;
         self.voted_for = None;
         self.stop_heartbeat_timers();
-        self.start_election_timer();
         info!(
             "[Node {}] role {:?} -> {:?}",
             self.node_id, prev_role, self.role
@@ -293,11 +303,13 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         let prev_role = self.role;
         self.role = Role::Leader;
         self.leader_id = Some(self.node_id);
+        self.next_backoff_index.clear();
         self.next_index.clear();
         self.match_index.clear();
         self.stop_election_timer();
         for node_id in 1..=self.num_nodes {
             if node_id != self.node_id {
+                self.next_backoff_index.insert(node_id, 1);
                 self.next_index
                     .insert(node_id, self.get_last_log_index() + 1);
                 self.match_index.insert(node_id, 0);
@@ -337,6 +349,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
 impl<Provider: DependencyProvider> EventLoop<Inbound> for Runner<Provider> {
     async fn run_eventloop(mut self) {
         self.become_follower(self.current_term);
+        self.start_election_timer();
         while let Some(event) = self.rx.recv().await {
             match event {
                 Inbound::MakeRequest(e) => self.on_event(e),
@@ -360,6 +373,7 @@ impl<Provider: DependencyProvider> OnEvent<MakeRequest> for Runner<Provider> {
                 debug!("[Node {}] forward to leader", self.node_id);
                 self.send_to(leader_id, event);
             } else {
+                // TODO: buffer the request until a leader is elected
                 debug!("[Node {}] leader not elected", self.node_id);
             }
             return;
@@ -435,10 +449,8 @@ impl<Provider: DependencyProvider> OnEvent<RequestVote> for Runner<Provider> {
             return;
         }
 
-        let mut election_timer_restarted = false;
         if event.term > self.current_term {
             self.become_follower(event.term);
-            election_timer_restarted = true;
         }
 
         let last_log_index = self.get_last_log_index();
@@ -450,9 +462,7 @@ impl<Provider: DependencyProvider> OnEvent<RequestVote> for Runner<Provider> {
             log_ok && (self.voted_for.is_none() || self.voted_for == Some(event.candidate_id));
         if grant_vote {
             self.voted_for = Some(event.candidate_id);
-            if !election_timer_restarted {
-                self.start_election_timer();
-            }
+            self.start_election_timer();
         }
 
         let reply = Vote {
@@ -475,6 +485,7 @@ impl<Provider: DependencyProvider> OnEvent<Vote> for Runner<Provider> {
                 self.node_id, event.term, self.current_term
             );
             self.become_follower(event.term);
+            self.start_election_timer();
             return;
         }
 
@@ -551,10 +562,9 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
                 );
                 self.become_follower(self.current_term);
             }
-            Role::Follower => {
-                self.start_election_timer();
-            }
+            _ => {}
         }
+        self.start_election_timer();
 
         self.log.truncate(event.prev_log_index as usize);
         self.log.extend(event.entries.into_iter());
@@ -582,6 +592,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
                 self.node_id, event.term, self.current_term
             );
             self.become_follower(event.term);
+            self.start_election_timer();
             return;
         }
 
@@ -599,13 +610,20 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
         }
 
         if event.success {
+            self.next_backoff_index.insert(event.node_id, 1);
             self.next_index
                 .insert(event.node_id, event.prev_log_index + 1);
             self.match_index.insert(event.node_id, event.prev_log_index);
             self.try_advance_commit_index();
         } else {
+            let backoff = self
+                .next_backoff_index
+                .get(&event.node_id)
+                .unwrap_or(&1)
+                .saturating_mul(2);
+            self.next_backoff_index.insert(event.node_id, backoff);
             self.next_index.entry(event.node_id).and_modify(|idx| {
-                *idx = idx.checked_sub(10).unwrap_or_default().max(1);
+                *idx = idx.checked_sub(backoff).unwrap_or_default().max(1);
             });
         }
     }

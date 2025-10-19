@@ -10,7 +10,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 async fn main() {
     const NUM_NODES: u64 = 5;
     const QUORUM: u64 = (NUM_NODES / 2) + 1;
-    const MESSAGE_DROP_PROBABILITY: f64 = 0.03; // 3% chance of dropping a message
+    const MESSAGE_DROP_PROBABILITY: f64 = 0.33; // 33% chance of dropping a message
     const MAX_MESSAGE_DELAY_MS: u64 = 150; // Max network latency in milliseconds
 
     // Initialize logging
@@ -40,7 +40,7 @@ async fn main() {
         while let Some((dest_node_id, message)) = network_rx.recv().await {
             // --- Simulate message dropping ---
             if rand::random_bool(MESSAGE_DROP_PROBABILITY) {
-                warn!("NETWORK: Dropping message to node {}", dest_node_id);
+                warn!("[Network] dropping message to node {}", dest_node_id);
                 continue; // Skip to the next message
             }
 
@@ -79,7 +79,7 @@ async fn main() {
 
             if let Some(node) = nodes_clone.get(&target_node_id) {
                 info!(
-                    "CLIENT: Sending request #{} to random node {}",
+                    "[Client] sending request #{} to random node {}",
                     request_id, target_node_id
                 );
                 let request = MakeRequest {
