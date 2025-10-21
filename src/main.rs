@@ -59,6 +59,7 @@ async fn main() {
                         Outbound::Vote(e) => node.recv(e),
                         Outbound::AppendEntries(e) => node.recv(e),
                         Outbound::AppendEntriesResponse(e) => node.recv(e),
+                        Outbound::CommitNotification(_) => {}
                     }
                 });
             }

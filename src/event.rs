@@ -42,6 +42,11 @@ pub struct AppendEntriesResponse {
     pub success: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct CommitNotification {
+    pub index: u64,
+}
+
 #[derive(Debug)]
 pub enum Outbound {
     MakeRequest(MakeRequest),
@@ -49,6 +54,7 @@ pub enum Outbound {
     Vote(Vote),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
+    CommitNotification(CommitNotification),
 }
 
 impl Into<Outbound> for MakeRequest {
@@ -78,6 +84,12 @@ impl Into<Outbound> for AppendEntries {
 impl Into<Outbound> for AppendEntriesResponse {
     fn into(self) -> Outbound {
         Outbound::AppendEntriesResponse(self)
+    }
+}
+
+impl Into<Outbound> for CommitNotification {
+    fn into(self) -> Outbound {
+        Outbound::CommitNotification(self)
     }
 }
 

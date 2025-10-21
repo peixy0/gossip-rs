@@ -13,7 +13,7 @@ pub(crate) enum Role {
 }
 
 #[derive(Debug)]
-pub(crate) struct InitiateHeartbeat(u64);
+pub(crate) struct InitiateHeartbeat(pub(crate) u64);
 
 #[derive(Debug)]
 pub(crate) struct InitiateElection;
@@ -276,6 +276,12 @@ impl<Provider: DependencyProvider> Runner<Provider> {
                     self.last_applied + 1,
                     entry
                 );
+                self.send_to(
+                    self.node_id,
+                    CommitNotification {
+                        index: self.last_applied + 1,
+                    },
+                );
                 self.last_applied += 1;
             } else {
                 break;
@@ -316,6 +322,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
             }
         }
         self.broadcast_heartbeat();
+        self.maybe_advance_commit_index();
         info!(
             "[Node {}] role {:?} -> {:?}",
             self.node_id, prev_role, self.role
@@ -332,7 +339,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         }
     }
 
-    fn try_advance_commit_index(&mut self) {
+    fn maybe_advance_commit_index(&mut self) {
         let mut match_indices: Vec<u64> = self.match_index.values().cloned().collect();
         match_indices.push(self.get_last_log_index());
         match_indices.sort_unstable_by(|a, b| b.cmp(a));
@@ -383,6 +390,7 @@ impl<Provider: DependencyProvider> OnEvent<MakeRequest> for Runner<Provider> {
             request: event.request,
         });
         self.broadcast_heartbeat();
+        self.maybe_advance_commit_index();
     }
 }
 
@@ -414,6 +422,17 @@ impl<Provider: DependencyProvider> OnEvent<InitiateElection> for Runner<Provider
         debug!("[Node {}] <- {:?}", self.node_id, event);
 
         self.become_candidate();
+
+        // Check if we already have quorum (single-node clusters)
+        if self.votes_collected.len() >= self.quorum as usize {
+            info!(
+                "[Node {}] won election for term {} (single-node cluster)",
+                self.node_id, self.current_term
+            );
+            self.become_leader();
+            return;
+        }
+
         let last_log_index = self.get_last_log_index();
         let rv = RequestVote {
             term: self.current_term,
@@ -614,7 +633,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
             self.next_index
                 .insert(event.node_id, event.prev_log_index + 1);
             self.match_index.insert(event.node_id, event.prev_log_index);
-            self.try_advance_commit_index();
+            self.maybe_advance_commit_index();
         } else {
             let backoff = self
                 .next_backoff_index
@@ -625,679 +644,6 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
             self.next_index.entry(event.node_id).and_modify(|idx| {
                 *idx = idx.checked_sub(backoff).unwrap_or_default().max(1);
             });
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::future;
-
-    struct NoopTimer;
-
-    impl timer::Timer for NoopTimer {}
-
-    #[derive(Clone)]
-    struct NoopTimerService;
-
-    impl timer::TimerService for NoopTimerService {
-        type Timer = NoopTimer;
-        fn create(
-            &self,
-            _duration: tokio::time::Duration,
-            _f: impl future::Future<Output = ()> + Send + 'static,
-        ) -> Self::Timer {
-            NoopTimer
-        }
-    }
-
-    struct TestDependencyProvider;
-
-    impl DependencyProvider for TestDependencyProvider {
-        type TimerService = NoopTimerService;
-    }
-
-    #[tokio::test]
-    async fn test_single_node_elect_itself_as_leader() {
-        let num_nodes = 1;
-        let node_id = 1;
-        let quorum = 1;
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (node, join_handle) = Node::<TestDependencyProvider>::new(
-            node_id,
-            num_nodes,
-            outbound_tx,
-            NoopTimerService,
-            quorum,
-        );
-        node.recv(Inbound::InitiateElection(InitiateElection));
-        let mut sent_to_nodes = HashSet::new();
-        while let Ok(Some((peer_id, event))) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
-        {
-            sent_to_nodes.insert(peer_id);
-            if let Outbound::AppendEntries(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.leader_id, 1);
-                assert_eq!(event.entries.len(), 0);
-            } else {
-                panic!("unexpected event");
-            }
-            if sent_to_nodes.len() == num_nodes as usize - 1 {
-                break;
-            }
-        }
-        node.shutdown();
-        join_handle.wait().await;
-    }
-
-    #[tokio::test]
-    async fn test_three_node_cluster_elect_leader() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-
-        let mut request_vote_recv = HashSet::new();
-        for _ in 0..num_nodes - 1 {
-            let (peer_id, event) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if let Outbound::RequestVote(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.candidate_id, 1);
-                request_vote_recv.insert(peer_id);
-            } else {
-                panic!("unexpected event");
-            }
-        }
-        assert_eq!(request_vote_recv, HashSet::from([2, 3]));
-
-        for i in 2..=num_nodes {
-            nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-
-        let mut heartbeat_recv = HashSet::new();
-        for _ in 0..num_nodes - 1 {
-            let (peer_id, event) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if let Outbound::AppendEntries(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.leader_id, 1);
-                heartbeat_recv.insert(peer_id);
-            } else {
-                panic!("unexpected event");
-            }
-        }
-        assert_eq!(heartbeat_recv, HashSet::from([2, 3]));
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_leader_election_failure() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-
-        for _ in 0..num_nodes - 1 {
-            let (_, event) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if let Outbound::RequestVote(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.candidate_id, 1);
-            } else {
-                panic!("unexpected event");
-            }
-        }
-
-        nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-            term: 1,
-            voter_id: 2,
-            granted: false,
-        }));
-        nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-            term: 1,
-            voter_id: 3,
-            granted: false,
-        }));
-
-        assert!(
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .is_err()
-        );
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_basic_log_replication() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-
-        for _ in 0..num_nodes - 1 {
-            let (_, event) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if let Outbound::RequestVote(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.candidate_id, 1);
-            } else {
-                panic!("unexpected event");
-            }
-        }
-
-        for i in 2..=num_nodes {
-            nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-
-        for _ in 0..num_nodes - 1 {
-            let (_, event) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if let Outbound::AppendEntries(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.leader_id, 1);
-            } else {
-                panic!("unexpected event");
-            }
-        }
-
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: "test".to_string(),
-            }));
-
-        let mut log_replication_recv = HashSet::new();
-        for _ in 0..num_nodes - 1 {
-            let (peer_id, event) =
-                tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-            if let Outbound::AppendEntries(event) = event {
-                assert_eq!(event.term, 1);
-                assert_eq!(event.leader_id, 1);
-                assert_eq!(event.entries.len(), 1);
-                assert_eq!(event.entries[0].request, "test");
-                log_replication_recv.insert(peer_id);
-            } else {
-                panic!("unexpected event");
-            }
-        }
-        assert_eq!(log_replication_recv, HashSet::from([2, 3]));
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_log_replication_with_inconsistencies() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        // Elect leader 1
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain RequestVotes
-        for i in 2..=num_nodes {
-            nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-        // Leader sends initial heartbeats. next_index[2] is 1.
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain heartbeats
-
-        // Now, let's add something to the leader's log.
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: "test".to_string(),
-            }));
-        // Leader sends AppendEntries. next_index[2] is now 2, prev_log_index is 1.
-        // Let's drain these.
-        let mut sent_to = HashSet::new();
-        for _ in 0..num_nodes - 1 {
-            let (peer_id, event) = outbound_rx.recv().await.unwrap();
-            if let Outbound::AppendEntries(e) = event {
-                if e.entries.len() == 1 {
-                    sent_to.insert(peer_id);
-                }
-            }
-        }
-        assert_eq!(sent_to.len(), 2);
-
-        // Now, we tell the leader that node 2 failed.
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                node_id: 2,
-                term: 1,
-                prev_log_index: 0, // This doesn't matter for the test
-                success: false,
-            }));
-
-        // Now we trigger a heartbeat to node 2 to force a retry.
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
-
-        // Check the retry AppendEntries
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(peer_id, 2);
-        if let Outbound::AppendEntries(event) = event {
-            assert_eq!(event.term, 1);
-            // After failure, next_index[2] was 2. It gets decremented. Let's say to 1.
-            // So prev_log_index should be 0.
-            assert_eq!(event.prev_log_index, 0);
-            // And it should contain the full log for that follower.
-            assert_eq!(event.entries.len(), 1);
-            assert_eq!(event.entries[0].request, "test");
-        } else {
-            panic!("unexpected event");
-        }
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_candidate_receives_append_entries_and_becomes_follower() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        // 1. Node 1 becomes a candidate
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-        // Drain RequestVotes
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        }
-
-        // 2. Node 2 sends an AppendEntries to Node 1 (simulating it won the election)
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::AppendEntries(AppendEntries {
-                term: 1,
-                leader_id: 2,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![],
-                leader_commit: 0,
-            }));
-
-        // 3. Verify Node 1 sends a success response to Node 2
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(peer_id, 2);
-        if let Outbound::AppendEntriesResponse(resp) = event {
-            assert!(resp.success);
-            assert_eq!(resp.term, 1);
-        } else {
-            panic!("unexpected event, expected AppendEntriesResponse");
-        }
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_follower_forwards_request_to_leader() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        // 1. Elect leader 1
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain RequestVotes
-        for i in 2..=num_nodes {
-            nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain heartbeats
-
-        // 2. Manually send AppendEntries to follower 2 to ensure it knows the leader
-        nodes
-            .get(&2)
-            .unwrap()
-            .0
-            .recv(Inbound::AppendEntries(AppendEntries {
-                term: 1,
-                leader_id: 1,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![],
-                leader_commit: 0,
-            }));
-        // Drain the response
-        let _ = outbound_rx.recv().await;
-
-        // 3. Send a request to a follower (node 2)
-        nodes
-            .get(&2)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: "test".to_string(),
-            }));
-
-        // 4. Verify the request is forwarded to the leader (node 1)
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(peer_id, 1);
-        if let Outbound::MakeRequest(req) = event {
-            assert_eq!(req.request, "test");
-        } else {
-            panic!("unexpected event, expected MakeRequest");
-        }
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_reject_vote_with_stale_term() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        // 1. Elect leader 1 to establish term 1
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain RequestVotes
-        for i in 2..=num_nodes {
-            nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain heartbeats
-
-        // 2. Node 2 sends a RequestVote to Node 1 with a stale term
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::RequestVote(RequestVote {
-                term: 0,
-                candidate_id: 2,
-                last_log_index: 0,
-                last_log_term: 0,
-            }));
-
-        // 3. Verify Node 1 rejects the vote
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(peer_id, 2);
-        if let Outbound::Vote(vote) = event {
-            assert!(!vote.granted);
-            assert_eq!(vote.term, 1);
-        } else {
-            panic!("unexpected event, expected Vote");
-        }
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn test_reject_append_entries_with_stale_term() {
-        let num_nodes = 3;
-        let quorum = 2;
-        let mut nodes = HashMap::new();
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
-        for i in 1..=num_nodes {
-            let (node, join_handle) = Node::<TestDependencyProvider>::new(
-                i,
-                num_nodes,
-                outbound_tx.clone(),
-                NoopTimerService,
-                quorum,
-            );
-            nodes.insert(i, (node, join_handle));
-        }
-
-        // 1. Elect leader 1 to establish term 1
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::InitiateElection(InitiateElection));
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain RequestVotes
-        for i in 2..=num_nodes {
-            nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-        for _ in 0..num_nodes - 1 {
-            let _ = outbound_rx.recv().await;
-        } // Drain heartbeats
-
-        // 2. Node 2 sends an AppendEntries to Node 1 with a stale term
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::AppendEntries(AppendEntries {
-                term: 0,
-                leader_id: 2,
-                prev_log_index: 0,
-                prev_log_term: 0,
-                entries: vec![],
-                leader_commit: 0,
-            }));
-
-        // 3. Verify Node 1 rejects the request
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(peer_id, 2);
-        if let Outbound::AppendEntriesResponse(resp) = event {
-            assert!(!resp.success);
-            assert_eq!(resp.term, 1);
-        } else {
-            panic!("unexpected event, expected AppendEntriesResponse");
-        }
-
-        for (node, join_handle) in nodes.into_values() {
-            node.shutdown();
-            join_handle.wait().await;
         }
     }
 }
