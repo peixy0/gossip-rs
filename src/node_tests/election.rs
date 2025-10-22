@@ -19,12 +19,7 @@ async fn test_single_node_elect_itself_as_leader() {
     );
 
     node.recv(Inbound::InitiateElection(InitiateElection));
-
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    expect_leader_elected(1, &mut outbound_rx).await;
 
     node.shutdown();
     join_handle.wait().await;
@@ -66,6 +61,8 @@ async fn test_three_node_cluster_elect_leader() {
             granted: true,
         }));
     }
+
+    expect_leader_elected(1, &mut outbound_rx).await;
 
     let mut heartbeat_recv = HashSet::new();
     for _ in 0..num_nodes - 1 {
@@ -266,6 +263,8 @@ async fn test_exact_quorum_vote() {
         voter_id: 3,
         granted: true,
     }));
+
+    expect_leader_elected(1, &mut outbound_rx).await;
 
     let mut heartbeat_count = 0;
     for _ in 0..num_nodes - 1 {

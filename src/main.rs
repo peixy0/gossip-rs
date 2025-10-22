@@ -66,17 +66,20 @@ async fn main() {
                             nodes_clone
                                 .get(&leader_id)
                                 .map(|leader_node| leader_node.recv(e));
+                        } else {
+                            warn!("[Network] no leader elected, dropping request");
                         }
+                    }
+                    Outbound::NetworkUpdateInd(e) => {
+                        leader = Some(e.leader_id);
                     }
                     Outbound::RequestVote(e) => maybe_dispatch_event(node, e),
                     Outbound::Vote(e) => maybe_dispatch_event(node, e),
                     Outbound::AppendEntries(e) => {
-                        leader = Some(e.leader_id);
                         maybe_dispatch_event(node, e);
                     }
                     Outbound::AppendEntriesResponse(e) => maybe_dispatch_event(node, e),
                     Outbound::InstallSnapshot(e) => {
-                        leader = Some(e.leader_id);
                         maybe_dispatch_event(node, e);
                     }
                     Outbound::InstallSnapshotResponse(e) => maybe_dispatch_event(node, e),
@@ -97,7 +100,7 @@ async fn main() {
                                 .as_bytes()
                                 .to_vec();
                             info!(
-                                "[Compaction] triggering compaction to {}",
+                                "[Compaction] triggering compaction {}",
                                 String::from_utf8(snapshot_data.clone()).unwrap()
                             );
                             committed_count = 0;

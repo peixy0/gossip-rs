@@ -1,34 +1,39 @@
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogEntry {
     pub term: u64,
     pub request: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MakeRequest {
     pub request: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct NetworkUpdateInd {
+    pub leader_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StateUpdateRequest {
     pub included_index: u64,
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StateUpdateResponse {
     pub included_index: u64,
     pub included_term: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StateUpdateCommand {
     pub included_index: u64,
     pub included_term: u64,
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RequestVote {
     pub term: u64,
     pub candidate_id: u64,
@@ -36,14 +41,14 @@ pub struct RequestVote {
     pub last_log_term: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Vote {
     pub term: u64,
     pub voter_id: u64,
     pub granted: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppendEntries {
     pub term: u64,
     pub leader_id: u64,
@@ -53,7 +58,7 @@ pub struct AppendEntries {
     pub leader_commit: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AppendEntriesResponse {
     pub node_id: u64,
     pub term: u64,
@@ -61,7 +66,7 @@ pub struct AppendEntriesResponse {
     pub success: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InstallSnapshot {
     pub term: u64,
     pub leader_id: u64,
@@ -70,22 +75,23 @@ pub struct InstallSnapshot {
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InstallSnapshotResponse {
     pub node_id: u64,
     pub term: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommitNotification {
     pub index: u64,
     pub term: u64,
     pub request: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Outbound {
     MakeRequest(MakeRequest),
+    NetworkUpdateInd(NetworkUpdateInd),
     RequestVote(RequestVote),
     Vote(Vote),
     AppendEntries(AppendEntries),
@@ -100,6 +106,12 @@ pub enum Outbound {
 impl Into<Outbound> for MakeRequest {
     fn into(self) -> Outbound {
         Outbound::MakeRequest(self)
+    }
+}
+
+impl Into<Outbound> for NetworkUpdateInd {
+    fn into(self) -> Outbound {
+        Outbound::NetworkUpdateInd(self)
     }
 }
 

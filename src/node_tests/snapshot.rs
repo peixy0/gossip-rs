@@ -503,11 +503,7 @@ async fn test_new_entries_after_snapshot() {
         .0
         .recv(Inbound::InitiateElection(InitiateElection));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(10), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    expect_leader_elected(1, &mut outbound_rx).await;
 
     for i in 1..=3 {
         nodes
@@ -634,11 +630,7 @@ async fn test_snapshot_with_empty_log() {
         .0
         .recv(Inbound::InitiateElection(InitiateElection));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(50), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    expect_leader_elected(1, &mut outbound_rx).await;
 
     nodes
         .get(&1)

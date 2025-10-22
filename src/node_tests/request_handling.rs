@@ -4,7 +4,7 @@ use crate::event::*;
 use crate::node::Inbound;
 
 #[tokio::test]
-async fn test_follower_forwards_request_to_leader() {
+async fn test_follower_drops_client_request() {
     let num_nodes = 3;
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
@@ -33,18 +33,11 @@ async fn test_follower_forwards_request_to_leader() {
             request: "test".as_bytes().to_vec(),
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
             .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 1);
-    if let Outbound::MakeRequest(req) = event {
-        assert_eq!(req.request, "test".as_bytes().to_vec());
-    } else {
-        panic!("unexpected event, expected MakeRequest: {:?}", event);
-    }
-
+            .is_err()
+    );
     shutdown_cluster(nodes).await;
 }
 
@@ -178,16 +171,11 @@ async fn test_request_during_leader_transition() {
             request: "during_transition".as_bytes().to_vec(),
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
             .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 1);
-    if let Outbound::MakeRequest(_) = event {
-    } else {
-        panic!("unexpected event: {:?}", event);
-    }
+            .is_err()
+    );
 
     shutdown_cluster(nodes).await;
 }
@@ -221,51 +209,6 @@ async fn test_request_with_empty_payload() {
         }
     }
     assert!(found);
-
-    shutdown_cluster(nodes).await;
-}
-
-#[tokio::test]
-async fn test_request_forwarding_chain() {
-    let num_nodes = 3;
-    let quorum = 2;
-    let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
-
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
-
-    nodes
-        .get(&2)
-        .unwrap()
-        .0
-        .recv(Inbound::AppendEntries(AppendEntries {
-            term: 1,
-            leader_id: 1,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        }));
-    drain_messages(&mut outbound_rx, 1).await;
-
-    nodes
-        .get(&2)
-        .unwrap()
-        .0
-        .recv(Inbound::MakeRequest(MakeRequest {
-            request: "chain_request".as_bytes().to_vec(),
-        }));
-
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 1);
-    if let Outbound::MakeRequest(req) = event {
-        assert_eq!(req.request, "chain_request".as_bytes().to_vec());
-    } else {
-        panic!("unexpected event: {:?}", event);
-    }
 
     shutdown_cluster(nodes).await;
 }

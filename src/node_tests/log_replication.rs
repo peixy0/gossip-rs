@@ -19,12 +19,7 @@ async fn test_single_node_log_commit() {
     );
 
     node.recv(Inbound::InitiateElection(InitiateElection));
-
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    expect_leader_elected(1, &mut outbound_rx).await;
 
     node.recv(Inbound::MakeRequest(MakeRequest {
         request: "test_entry_1".as_bytes().to_vec(),
@@ -321,11 +316,6 @@ async fn test_log_replication_after_failure_and_recovery() {
             success: false,
         }));
 
-    nodes
-        .get(&1)
-        .unwrap()
-        .0
-        .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
     drain_messages(&mut outbound_rx, 1).await;
 
     nodes

@@ -166,7 +166,6 @@ trait OnEvent<T> {
 struct Runner<Provider: DependencyProvider> {
     node_id: u64,
     num_nodes: u64,
-    leader_id: Option<u64>,
     rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     internal_tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<(u64, Outbound)>,
@@ -214,7 +213,6 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         Self {
             node_id,
             num_nodes,
-            leader_id: None,
             rx,
             internal_tx,
             outbound_tx,
@@ -302,7 +300,6 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     fn become_follower(&mut self, term: u64) {
         let prev_role = self.role;
         self.role = Role::Follower;
-        self.leader_id = None;
         self.current_term = term;
         self.voted_for = None;
         self.stop_heartbeat_timers();
@@ -340,7 +337,6 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     fn become_candidate(&mut self) {
         let prev_role = self.role;
         self.role = Role::Candidate;
-        self.leader_id = None;
         self.current_term += 1;
         self.voted_for = Some(self.node_id);
         self.votes_collected.clear();
@@ -356,11 +352,17 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     fn become_leader(&mut self) {
         let prev_role = self.role;
         self.role = Role::Leader;
-        self.leader_id = Some(self.node_id);
         self.next_backoff_index.clear();
         self.next_index.clear();
         self.match_index.clear();
         self.stop_election_timer();
+        self.send_to(
+            self.node_id,
+            NetworkUpdateInd {
+                leader_id: self.node_id,
+            },
+        );
+
         for node_id in 1..=self.num_nodes {
             if node_id != self.node_id {
                 self.next_backoff_index.insert(node_id, 1);
@@ -370,6 +372,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
             }
         }
         self.broadcast_heartbeat();
+
         self.maybe_advance_commit_index();
         info!(
             "[Node {}] role {:?} -> {:?}",
@@ -442,13 +445,7 @@ impl<Provider: DependencyProvider> OnEvent<MakeRequest> for Runner<Provider> {
     fn on_event(&mut self, event: MakeRequest) {
         debug!("[Node {}] <- {:?}", self.node_id, event);
         if self.role != Role::Leader {
-            if let Some(leader_id) = self.leader_id {
-                debug!("[Node {}] forward to leader", self.node_id);
-                self.send_to(leader_id, event);
-            } else {
-                // TODO: buffer the request until a leader is elected
-                debug!("[Node {}] leader not elected", self.node_id);
-            }
+            warn!("[Node {}] dropping event, not leader", self.node_id);
             return;
         }
         self.log.push(LogEntry {
@@ -682,7 +679,6 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
         }
 
         self.current_term = event.term;
-        self.leader_id = Some(event.leader_id);
 
         match self.role {
             Role::Leader | Role::Candidate => {
@@ -758,6 +754,9 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
             self.next_index.entry(event.node_id).and_modify(|idx| {
                 *idx = idx.checked_sub(backoff).unwrap_or_default().max(1);
             });
+            let _ = self
+                .internal_tx
+                .send(Inbound::InitiateHeartbeat(InitiateHeartbeat(event.node_id)));
         }
     }
 }
@@ -813,8 +812,6 @@ impl<Provider: DependencyProvider> OnEvent<InstallSnapshot> for Runner<Provider>
         if event.term > self.current_term {
             self.become_follower(event.term);
         }
-
-        self.leader_id = Some(event.leader_id);
         self.start_election_timer();
 
         if self.commit_index < self.last_included_index {

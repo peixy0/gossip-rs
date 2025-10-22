@@ -94,6 +94,22 @@ pub(crate) async fn shutdown_cluster(
     }
 }
 
+/// Helper to expect a leader elected event
+pub(crate) async fn expect_leader_elected(
+    leader_id: u64,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(u64, Outbound)>,
+) {
+    let (peer_id, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer_id, leader_id);
+    assert_eq!(
+        event,
+        Outbound::NetworkUpdateInd(NetworkUpdateInd { leader_id })
+    );
+}
+
 /// Helper to elect a leader by sending votes from all peers
 pub(crate) async fn elect_leader(
     nodes: &HashMap<u64, (Node<TestDependencyProvider>, crate::node::JoinHandle)>,
@@ -121,6 +137,8 @@ pub(crate) async fn elect_leader(
             }));
         }
     }
+
+    expect_leader_elected(leader_id, rx).await;
 
     // Drain heartbeats
     drain_messages(rx, (num_nodes - 1) as usize).await;
