@@ -402,21 +402,6 @@ impl<Provider: DependencyProvider> Runner<Provider> {
             self.advance_commit_index();
         }
     }
-
-    fn compact_log_up_to(&mut self, last_included_index: u64) {
-        if last_included_index <= self.last_included_index {
-            return;
-        }
-
-        let remove = (last_included_index - self.last_included_index) as usize;
-        if remove > self.log.len() {
-            return;
-        }
-
-        self.last_included_term = self.get_log_term(last_included_index);
-        self.last_included_index = last_included_index;
-        self.log.drain(0..remove);
-    }
 }
 
 impl<Provider: DependencyProvider> EventLoop<Inbound> for Runner<Provider> {
@@ -633,7 +618,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
 
         if event.term < self.current_term {
             debug!(
-                "[Node {}] dropping event, term {} < current_term {}",
+                "[Node {}] rejecting event, term {} < current_term {}",
                 self.node_id, event.term, self.current_term
             );
 
@@ -649,13 +634,13 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
 
         if event.prev_log_index < self.last_included_index {
             debug!(
-                "[Node {}] dropping event, prev_log_index {} < last_included_index {}",
+                "[Node {}] rejecting event, prev_log_index {} < last_included_index {}",
                 self.node_id, event.prev_log_index, self.last_included_index
             );
             let resp = AppendEntriesResponse {
                 node_id: self.node_id,
                 term: self.current_term,
-                prev_log_index: 0,
+                prev_log_index: self.last_included_index + self.log.len() as u64,
                 success: false,
             };
             self.send_to(event.leader_id, resp);
@@ -671,7 +656,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             let resp = AppendEntriesResponse {
                 node_id: self.node_id,
                 term: self.current_term,
-                prev_log_index: 0,
+                prev_log_index: self.last_included_index + self.log.len() as u64,
                 success: false,
             };
             self.send_to(event.leader_id, resp);
@@ -764,24 +749,21 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
 impl<Provider: DependencyProvider> OnEvent<StateUpdateRequest> for Runner<Provider> {
     fn on_event(&mut self, event: StateUpdateRequest) {
         debug!("[Node {}] <- {:?}", self.node_id, event);
-        if self.role != Role::Leader {
-            debug!("[Node {}] dropping event, not leader", self.node_id);
+
+        if event.included_index <= self.last_included_index {
             return;
         }
 
-        // Get the term before compacting
-        let included_term = self.get_log_term(event.included_index);
-
-        self.compact_log_up_to(event.included_index);
-
-        // Always update snapshot state even if compaction didn't happen
-        // (e.g., if the log was already shorter than included_index)
-        if event.included_index > self.last_included_index {
-            self.last_included_index = event.included_index;
-            self.last_included_term = included_term;
+        let remove = (event.included_index - self.last_included_index) as usize;
+        if remove > self.log.len() {
+            return;
         }
 
-        self.snapshot = Some(event.data.clone());
+        self.last_included_term = self.get_log_term(event.included_index);
+        self.last_included_index = event.included_index;
+        self.log.drain(0..remove);
+        self.snapshot = Some(event.data);
+
         self.send_to(
             self.node_id,
             StateUpdateResponse {

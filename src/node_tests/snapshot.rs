@@ -214,26 +214,38 @@ async fn test_leader_processes_snapshot_response() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    for i in 1..=11 {
+        nodes
+            .get(&1)
+            .unwrap()
+            .0
+            .recv(Inbound::MakeRequest(MakeRequest {
+                request: format!("request_{}", i).into_bytes().to_vec(),
+            }));
+        drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    }
+
     nodes
         .get(&1)
         .unwrap()
         .0
         .recv(Inbound::StateUpdateRequest(StateUpdateRequest {
             included_index: 10,
-            data: b"snapshot".to_vec(),
+            data: b"snapshot_up_to_10".to_vec(),
         }));
-
-    // Drain StateUpdateResponse from the snapshot
-    drain_messages(&mut outbound_rx, 1).await;
-
-    nodes
-        .get(&1)
-        .unwrap()
-        .0
-        .recv(Inbound::MakeRequest(MakeRequest {
-            request: b"entry_11".to_vec(),
-        }));
-    drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    let (peer_id, event) =
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+            .await
+            .expect("Should receive AppendEntries")
+            .expect("Channel should not be closed");
+    assert_eq!(peer_id, 1);
+    assert_eq!(
+        event,
+        Outbound::StateUpdateResponse(StateUpdateResponse {
+            included_index: 10,
+            included_term: 1,
+        })
+    );
 
     nodes
         .get(&1)
@@ -641,15 +653,8 @@ async fn test_snapshot_with_empty_log() {
             data: b"empty_snapshot".to_vec(),
         }));
 
-    // Drain StateUpdateResponse from the snapshot
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-        .await
-        .expect("Should receive StateUpdateResponse")
-        .expect("Channel should not be closed");
-    assert!(matches!(event, Outbound::StateUpdateResponse(_)));
-
     assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(50), outbound_rx.recv())
+        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
             .await
             .is_err()
     );
@@ -740,7 +745,7 @@ async fn test_multiple_snapshots_sequential() {
     }
 
     while let Ok(Some(_)) =
-        tokio::time::timeout(tokio::time::Duration::from_millis(10), outbound_rx.recv()).await
+        tokio::time::timeout(tokio::time::Duration::from_millis(50), outbound_rx.recv()).await
     {}
 
     nodes

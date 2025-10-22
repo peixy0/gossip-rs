@@ -105,14 +105,12 @@ async fn main() {
                             );
                             committed_count = 0;
 
-                            if let Some(leader_id) = leader {
-                                nodes_clone.get(&leader_id).map(|leader_node| {
-                                    leader_node.recv(StateUpdateRequest {
-                                        included_index: current_commit_index,
-                                        data: snapshot_data,
-                                    })
+                            nodes_clone.iter().for_each(|(_, node)| {
+                                node.recv(StateUpdateRequest {
+                                    included_index: current_commit_index,
+                                    data: snapshot_data.clone(),
                                 });
-                            }
+                            });
                         }
                     }
                     Outbound::StateUpdateResponse(e) => {
