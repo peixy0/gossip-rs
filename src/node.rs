@@ -751,6 +751,18 @@ impl<Provider: DependencyProvider> OnEvent<StateUpdateRequest> for Runner<Provid
         debug!("[Node {}] <- {:?}", self.node_id, event);
 
         if event.included_index <= self.last_included_index {
+            warn!(
+                "[Node {}] dropping event, included_index {} < last_included_index {}",
+                self.node_id, event.included_index, self.last_included_index
+            );
+            return;
+        }
+
+        if event.included_index > self.commit_index {
+            warn!(
+                "[Node {}] dropping event, included_index {} > commit_index {}",
+                self.node_id, event.included_index, self.commit_index
+            );
             return;
         }
 

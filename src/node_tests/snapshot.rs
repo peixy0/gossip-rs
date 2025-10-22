@@ -209,7 +209,7 @@ async fn test_follower_rejects_snapshot_with_stale_term() {
 #[tokio::test]
 async fn test_leader_processes_snapshot_response() {
     let num_nodes = 3;
-    let quorum = 2;
+    let quorum = 3;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
@@ -222,7 +222,39 @@ async fn test_leader_processes_snapshot_response() {
             .recv(Inbound::MakeRequest(MakeRequest {
                 request: format!("request_{}", i).into_bytes().to_vec(),
             }));
-        drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+
+        for _ in 1..num_nodes {
+            let (peer_id, event) = outbound_rx
+                .recv()
+                .await
+                .expect("Should receive AppendEntries");
+            if let Outbound::AppendEntries(ae) = event {
+                nodes
+                    .get(&1)
+                    .unwrap()
+                    .0
+                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
+                        node_id: peer_id,
+                        term: ae.term,
+                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
+                        success: true,
+                    }));
+            }
+        }
+
+        let (peer_id, event) = outbound_rx
+            .recv()
+            .await
+            .expect("Should receive CommitNotification");
+        assert_eq!(peer_id, 1);
+        assert_eq!(
+            event,
+            Outbound::CommitNotification(CommitNotification {
+                term: 1,
+                index: i,
+                request: format!("request_{}", i).into_bytes().to_vec(),
+            })
+        );
     }
 
     nodes
@@ -784,7 +816,7 @@ async fn test_multiple_snapshots_sequential() {
 #[tokio::test]
 async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
     let num_nodes = 3;
-    let quorum = 2;
+    let quorum = 3;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
@@ -795,9 +827,41 @@ async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
             .unwrap()
             .0
             .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("entry_{}", i).as_bytes().to_vec(),
+                request: format!("request_{}", i).as_bytes().to_vec(),
             }));
-        drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+
+        for _ in 1..num_nodes {
+            let (peer_id, event) = outbound_rx
+                .recv()
+                .await
+                .expect("Should receive AppendEntries");
+            if let Outbound::AppendEntries(ae) = event {
+                nodes
+                    .get(&1)
+                    .unwrap()
+                    .0
+                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
+                        node_id: peer_id,
+                        term: ae.term,
+                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
+                        success: true,
+                    }));
+            }
+        }
+
+        let (peer_id, event) = outbound_rx
+            .recv()
+            .await
+            .expect("Should receive CommitNotification");
+        assert_eq!(peer_id, 1);
+        assert_eq!(
+            event,
+            Outbound::CommitNotification(CommitNotification {
+                term: 1,
+                index: i,
+                request: format!("request_{}", i).into_bytes().to_vec(),
+            })
+        );
     }
 
     let snapshot_data = b"snapshot_1_to_8".to_vec();
