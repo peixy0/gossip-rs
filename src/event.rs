@@ -1,12 +1,31 @@
 #[derive(Clone, Debug)]
 pub struct LogEntry {
     pub term: u64,
-    pub request: String,
+    pub request: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 pub struct MakeRequest {
-    pub request: String,
+    pub request: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateUpdateRequest {
+    pub included_index: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StateUpdateResponse {
+    pub included_index: u64,
+    pub included_term: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct StateUpdateCommand {
+    pub included_index: u64,
+    pub included_term: u64,
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,8 +62,25 @@ pub struct AppendEntriesResponse {
 }
 
 #[derive(Clone, Debug)]
+pub struct InstallSnapshot {
+    pub term: u64,
+    pub leader_id: u64,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallSnapshotResponse {
+    pub node_id: u64,
+    pub term: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct CommitNotification {
     pub index: u64,
+    pub term: u64,
+    pub request: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -54,7 +90,11 @@ pub enum Outbound {
     Vote(Vote),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotResponse(InstallSnapshotResponse),
     CommitNotification(CommitNotification),
+    StateUpdateResponse(StateUpdateResponse),
+    StateUpdateCommand(StateUpdateCommand),
 }
 
 impl Into<Outbound> for MakeRequest {
@@ -90,6 +130,30 @@ impl Into<Outbound> for AppendEntriesResponse {
 impl Into<Outbound> for CommitNotification {
     fn into(self) -> Outbound {
         Outbound::CommitNotification(self)
+    }
+}
+
+impl Into<Outbound> for InstallSnapshot {
+    fn into(self) -> Outbound {
+        Outbound::InstallSnapshot(self)
+    }
+}
+
+impl Into<Outbound> for InstallSnapshotResponse {
+    fn into(self) -> Outbound {
+        Outbound::InstallSnapshotResponse(self)
+    }
+}
+
+impl Into<Outbound> for StateUpdateResponse {
+    fn into(self) -> Outbound {
+        Outbound::StateUpdateResponse(self)
+    }
+}
+
+impl Into<Outbound> for StateUpdateCommand {
+    fn into(self) -> Outbound {
+        Outbound::StateUpdateCommand(self)
     }
 }
 
