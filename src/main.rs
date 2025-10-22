@@ -57,75 +57,71 @@ async fn main() {
     // It also tracks CommitNotifications to trigger log compaction.
     tokio::spawn(async move {
         let mut leader = None;
-        let mut committed_count = 0u64;
+        let mut committed_count = HashMap::new();
         while let Some((dest_node_id, message)) = network_rx.recv().await {
-            if let Some(node) = nodes_clone.get(&dest_node_id).cloned() {
-                match message {
-                    Outbound::MakeRequest(e) => {
-                        if let Some(leader_id) = leader {
-                            nodes_clone
-                                .get(&leader_id)
-                                .map(|leader_node| leader_node.recv(e));
-                        } else {
-                            warn!("[Network] no leader elected, dropping request");
-                        }
+            let node = nodes_clone[&dest_node_id].clone();
+            match message {
+                Outbound::MakeRequest(e) => {
+                    if let Some(leader_id) = leader {
+                        nodes_clone[&leader_id].recv(e);
+                    } else {
+                        warn!("[Network] no leader elected, dropping request");
                     }
-                    Outbound::NetworkUpdateInd(e) => {
-                        leader = Some(e.leader_id);
-                    }
-                    Outbound::RequestVote(e) => maybe_dispatch_event(node, e),
-                    Outbound::Vote(e) => maybe_dispatch_event(node, e),
-                    Outbound::AppendEntries(e) => {
-                        maybe_dispatch_event(node, e);
-                    }
-                    Outbound::AppendEntriesResponse(e) => maybe_dispatch_event(node, e),
-                    Outbound::InstallSnapshot(e) => {
-                        maybe_dispatch_event(node, e);
-                    }
-                    Outbound::InstallSnapshotResponse(e) => maybe_dispatch_event(node, e),
-                    Outbound::CommitNotification(e) => {
-                        info!(
-                            "[Node {}] commit request index {} term {} {}",
-                            dest_node_id,
-                            e.index,
-                            e.term,
-                            String::from_utf8(e.request).unwrap()
-                        );
+                }
+                Outbound::NetworkUpdateInd(e) => {
+                    leader = Some(e.leader_id);
+                }
+                Outbound::RequestVote(e) => maybe_dispatch_event(node, e),
+                Outbound::Vote(e) => maybe_dispatch_event(node, e),
+                Outbound::AppendEntries(e) => {
+                    maybe_dispatch_event(node, e);
+                }
+                Outbound::AppendEntriesResponse(e) => maybe_dispatch_event(node, e),
+                Outbound::InstallSnapshot(e) => {
+                    maybe_dispatch_event(node, e);
+                }
+                Outbound::InstallSnapshotResponse(e) => maybe_dispatch_event(node, e),
+                Outbound::CommitNotification(e) => {
+                    info!(
+                        "[Node {}] commit request index {} term {} {}",
+                        dest_node_id,
+                        e.index,
+                        e.term,
+                        String::from_utf8(e.request).unwrap()
+                    );
 
-                        committed_count += 1;
-                        let current_commit_index = e.index;
+                    let count = committed_count.entry(dest_node_id).or_default();
+                    *count += 1;
+                    let current_commit_index = e.index;
 
-                        if committed_count >= SNAPSHOT_THRESHOLD * NUM_NODES {
-                            let snapshot_data = format!("snapshot_up_to_{}", current_commit_index)
-                                .as_bytes()
-                                .to_vec();
-                            info!(
-                                "[Compaction] triggering compaction {}",
-                                String::from_utf8(snapshot_data.clone()).unwrap()
-                            );
-                            committed_count = 0;
+                    if *count >= SNAPSHOT_THRESHOLD {
+                        let snapshot_data = format!("snapshot_up_to_{}", current_commit_index)
+                            .as_bytes()
+                            .to_vec();
+                        info!(
+                            "[Compaction] triggering compaction {}",
+                            String::from_utf8(snapshot_data.clone()).unwrap()
+                        );
+                        *count = 0;
 
-                            nodes_clone.iter().for_each(|(_, node)| {
-                                node.recv(StateUpdateRequest {
-                                    included_index: current_commit_index,
-                                    data: snapshot_data.clone(),
-                                });
-                            });
-                        }
+                        nodes_clone[&dest_node_id].recv(StateUpdateRequest {
+                            included_index: current_commit_index,
+                            data: snapshot_data.clone(),
+                        });
                     }
-                    Outbound::StateUpdateResponse(e) => {
-                        info!(
-                            "[Node {}] snapshot created at index {} term {}",
-                            dest_node_id, e.included_index, e.included_term,
-                        );
-                    }
-                    Outbound::StateUpdateCommand(e) => {
-                        info!(
-                            "[Node {}] commit snapshot {}",
-                            dest_node_id,
-                            String::from_utf8(e.data).unwrap(),
-                        );
-                    }
+                }
+                Outbound::StateUpdateResponse(e) => {
+                    info!(
+                        "[Node {}] snapshot created at index {} term {}",
+                        dest_node_id, e.included_index, e.included_term,
+                    );
+                }
+                Outbound::StateUpdateCommand(e) => {
+                    info!(
+                        "[Node {}] commit snapshot {}",
+                        dest_node_id,
+                        String::from_utf8(e.data).unwrap(),
+                    );
                 }
             }
         }
