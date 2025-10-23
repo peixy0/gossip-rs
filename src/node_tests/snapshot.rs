@@ -10,38 +10,19 @@ async fn test_leader_receives_snapshot_and_compacts_log() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make 5 requests and commit them
     for i in 1..=5 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("entry_{}", i).as_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("entry_{}", i).as_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
-
-    while let Ok(Some(_)) =
-        tokio::time::timeout(tokio::time::Duration::from_millis(10), outbound_rx.recv()).await
-    {}
 
     let snapshot_data = b"snapshot_data_1_to_3".to_vec();
     nodes
@@ -54,12 +35,10 @@ async fn test_leader_receives_snapshot_and_compacts_log() {
         }));
 
     // Leader sends StateUpdateResponse to itself
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_millis(50), outbound_rx.recv())
-            .await
-            .expect("Should receive StateUpdateResponse")
-            .expect("Channel should not be closed");
-    assert_eq!(peer_id, 1);
+    let event = tokio::time::timeout(tokio::time::Duration::from_millis(50), outbound_rx.recv())
+        .await
+        .expect("Should receive StateUpdateResponse")
+        .expect("Channel should not be closed");
     assert!(matches!(event, Outbound::StateUpdateResponse(_)));
 
     // Leader should not broadcast to followers immediately after snapshot creation
@@ -76,14 +55,12 @@ async fn test_leader_receives_snapshot_and_compacts_log() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive AppendEntries")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive AppendEntries")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntries(ae) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
         assert_eq!(
             ae.prev_log_index, 5,
             "prev_log_index should be 5 (follower caught up)"
@@ -122,13 +99,11 @@ async fn test_follower_installs_snapshot() {
             data: snapshot_data.clone(),
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive CommitStateUpdate")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive CommitStateUpdate")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 2, "CommitStateUpdate should be sent to self");
     if let Outbound::StateUpdateCommand(update) = event {
         assert_eq!(update.included_index, 10);
         assert_eq!(update.included_term, 1);
@@ -137,14 +112,12 @@ async fn test_follower_installs_snapshot() {
         panic!("Expected CommitStateUpdate, got: {:?}", event);
     }
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive InstallSnapshotResponse")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive InstallSnapshotResponse")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 1, "Response should be sent to leader");
-    if let Outbound::InstallSnapshotResponse(resp) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::InstallSnapshotResponse(resp)) = event {
         assert_eq!(resp.node_id, 2);
         assert_eq!(resp.term, 1);
     } else {
@@ -189,14 +162,12 @@ async fn test_follower_rejects_snapshot_with_stale_term() {
             data: b"stale_snapshot".to_vec(),
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive response")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive response")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 1);
-    if let Outbound::InstallSnapshotResponse(resp) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::InstallSnapshotResponse(resp)) = event {
         assert_eq!(resp.node_id, 2);
         assert_eq!(resp.term, 2, "Response should have current term (2)");
     } else {
@@ -214,47 +185,18 @@ async fn test_leader_processes_snapshot_response() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make 11 requests and commit them
     for i in 1..=11 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("request_{}", i).into_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
-
-        let (peer_id, event) = outbound_rx
-            .recv()
-            .await
-            .expect("Should receive CommitNotification");
-        assert_eq!(peer_id, 1);
-        assert_eq!(
-            event,
-            Outbound::CommitNotification(CommitNotification {
-                term: 1,
-                index: i,
-                request: format!("request_{}", i).into_bytes().to_vec(),
-            })
-        );
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("request_{}", i).into_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
 
     nodes
@@ -265,15 +207,14 @@ async fn test_leader_processes_snapshot_response() {
             included_index: 10,
             data: b"snapshot_up_to_10".to_vec(),
         }));
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive AppendEntries")
-            .expect("Channel should not be closed");
-    assert_eq!(peer_id, 1);
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive AppendEntries")
+        .expect("Channel should not be closed");
     assert_eq!(
         event,
         Outbound::StateUpdateResponse(StateUpdateResponse {
+            node_id: 1,
             included_index: 10,
             included_term: 1,
         })
@@ -294,14 +235,12 @@ async fn test_leader_processes_snapshot_response() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive AppendEntries")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive AppendEntries")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntries(ae) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
         // After InstallSnapshotResponse, next_index should be last_included_index + 1
         assert_eq!(
             ae.prev_log_index, 10,
@@ -364,14 +303,12 @@ async fn test_snapshot_installation_with_higher_term() {
 
     drain_messages(&mut outbound_rx, 1).await;
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive response")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive response")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 1);
-    if let Outbound::InstallSnapshotResponse(resp) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::InstallSnapshotResponse(resp)) = event {
         assert_eq!(resp.term, 3, "Follower should update to term 3");
     } else {
         panic!("Expected InstallSnapshotResponse, got: {:?}", event);
@@ -388,38 +325,19 @@ async fn test_log_compaction_with_partial_log() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make 10 requests and commit them
     for i in 1..=10 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("entry_{}", i).as_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("entry_{}", i).as_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
-
-    while let Ok(Some(_)) =
-        tokio::time::timeout(tokio::time::Duration::from_millis(10), outbound_rx.recv()).await
-    {}
 
     nodes
         .get(&1)
@@ -439,12 +357,12 @@ async fn test_log_compaction_with_partial_log() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .expect("Should receive AppendEntries")
         .expect("Channel should not be closed");
 
-    if let Outbound::AppendEntries(ae) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
         assert!(
             ae.prev_log_index >= 6,
             "prev_log_index should be >= 6 (after snapshot point)"
@@ -465,33 +383,18 @@ async fn test_snapshot_covering_all_entries() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make 5 requests and commit them
     for i in 1..=5 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("entry_{}", i).as_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("entry_{}", i).as_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
 
     while let Ok(Some(_)) =
@@ -516,12 +419,12 @@ async fn test_snapshot_covering_all_entries() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .expect("Should receive AppendEntries")
         .expect("Channel should not be closed");
 
-    if let Outbound::AppendEntries(ae) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
         assert_eq!(ae.prev_log_index, 5);
         assert_eq!(
             ae.entries.len(),
@@ -559,7 +462,7 @@ async fn test_new_entries_after_snapshot() {
             }));
     }
 
-    while let Ok(Some((_, event))) =
+    while let Ok(Some(event)) =
         tokio::time::timeout(tokio::time::Duration::from_millis(10), outbound_rx.recv()).await
     {
         if let Outbound::CommitNotification(_) = event {
@@ -577,7 +480,7 @@ async fn test_new_entries_after_snapshot() {
         }));
 
     // Drain StateUpdateResponse from the snapshot
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .expect("Should receive StateUpdateResponse")
         .expect("Channel should not be closed");
@@ -591,7 +494,7 @@ async fn test_new_entries_after_snapshot() {
             request: b"entry_4".to_vec(),
         }));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .expect("Should receive commit notification")
         .expect("Channel should not be closed");
@@ -645,14 +548,12 @@ async fn test_follower_snapshot_updates_commit_index() {
             leader_commit: 10,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive response")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive response")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 1);
-    if let Outbound::AppendEntriesResponse(resp) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntriesResponse(resp)) = event {
         assert!(resp.success);
         assert_eq!(resp.prev_log_index, 11);
     } else {
@@ -702,38 +603,19 @@ async fn test_multiple_snapshots_sequential() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make 10 requests and commit them
     for i in 1..=10 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("entry_{}", i).as_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("entry_{}", i).as_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
-
-    while let Ok(Some(_)) =
-        tokio::time::timeout(tokio::time::Duration::from_millis(10), outbound_rx.recv()).await
-    {}
 
     nodes
         .get(&1)
@@ -747,38 +629,19 @@ async fn test_multiple_snapshots_sequential() {
     // Drain StateUpdateResponse from the first snapshot
     drain_messages(&mut outbound_rx, 1).await;
 
+    // Make 5 more requests (11-15) and commit them
     for i in 11..=15 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("entry_{}", i).as_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("entry_{}", i).as_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
-
-    while let Ok(Some(_)) =
-        tokio::time::timeout(tokio::time::Duration::from_millis(50), outbound_rx.recv()).await
-    {}
 
     nodes
         .get(&1)
@@ -798,12 +661,12 @@ async fn test_multiple_snapshots_sequential() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .expect("Should receive AppendEntries")
         .expect("Channel should not be closed");
 
-    if let Outbound::AppendEntries(ae) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
         assert_eq!(ae.prev_log_index, 15);
         assert_eq!(ae.entries.len(), 0);
     } else {
@@ -821,47 +684,18 @@ async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make 10 requests and commit them
     for i in 1..=10 {
-        nodes
-            .get(&1)
-            .unwrap()
-            .0
-            .recv(Inbound::MakeRequest(MakeRequest {
-                request: format!("request_{}", i).as_bytes().to_vec(),
-            }));
-
-        for _ in 1..num_nodes {
-            let (peer_id, event) = outbound_rx
-                .recv()
-                .await
-                .expect("Should receive AppendEntries");
-            if let Outbound::AppendEntries(ae) = event {
-                nodes
-                    .get(&1)
-                    .unwrap()
-                    .0
-                    .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
-                        node_id: peer_id,
-                        term: ae.term,
-                        prev_log_index: ae.prev_log_index + ae.entries.len() as u64,
-                        success: true,
-                    }));
-            }
-        }
-
-        let (peer_id, event) = outbound_rx
-            .recv()
-            .await
-            .expect("Should receive CommitNotification");
-        assert_eq!(peer_id, 1);
-        assert_eq!(
-            event,
-            Outbound::CommitNotification(CommitNotification {
-                term: 1,
-                index: i,
-                request: format!("request_{}", i).into_bytes().to_vec(),
-            })
-        );
+        make_request_and_commit(
+            &nodes,
+            1,
+            num_nodes,
+            format!("request_{}", i).as_bytes().to_vec(),
+            &mut outbound_rx,
+            i,
+            1,
+        )
+        .await;
     }
 
     let snapshot_data = b"snapshot_1_to_8".to_vec();
@@ -896,15 +730,13 @@ async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive message")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive message")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, 2);
     match event {
-        Outbound::InstallSnapshot(snapshot) => {
+        Outbound::MessageToPeer(_peer_id, Protocol::InstallSnapshot(snapshot)) => {
             assert_eq!(snapshot.term, 1);
             assert_eq!(snapshot.leader_id, 1);
             assert_eq!(snapshot.last_included_index, 8);

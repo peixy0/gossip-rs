@@ -61,8 +61,8 @@ pub struct Node<Provider> {
 impl<Provider: DependencyProvider + 'static> Node<Provider> {
     pub fn new(
         node_id: u64,
-        num_nodes: u64,
-        outbound_tx: tokio::sync::mpsc::UnboundedSender<(u64, Outbound)>,
+        node_pool: Vec<u64>,
+        outbound_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
         timer_service: Provider::TimerService,
         quorum: u64,
     ) -> (Self, JoinHandle) {
@@ -70,7 +70,7 @@ impl<Provider: DependencyProvider + 'static> Node<Provider> {
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         let runner = Runner::<Provider>::new(
             node_id,
-            num_nodes,
+            node_pool,
             runner_rx,
             runner_tx.clone(),
             outbound_tx,
@@ -165,10 +165,10 @@ trait OnEvent<T> {
 
 struct Runner<Provider: DependencyProvider> {
     node_id: u64,
-    num_nodes: u64,
+    node_pool: Vec<u64>,
     rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
     internal_tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
-    outbound_tx: tokio::sync::mpsc::UnboundedSender<(u64, Outbound)>,
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
     timer_service: Provider::TimerService,
 
     role: Role,
@@ -203,16 +203,16 @@ struct Runner<Provider: DependencyProvider> {
 impl<Provider: DependencyProvider> Runner<Provider> {
     fn new(
         node_id: u64,
-        num_nodes: u64,
+        node_pool: Vec<u64>,
         rx: tokio::sync::mpsc::UnboundedReceiver<Inbound>,
         internal_tx: tokio::sync::mpsc::UnboundedSender<Inbound>,
-        outbound_tx: tokio::sync::mpsc::UnboundedSender<(u64, Outbound)>,
+        outbound_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
         timer_service: Provider::TimerService,
         quorum: u64,
     ) -> Self {
         Self {
             node_id,
-            num_nodes,
+            node_pool,
             rx,
             internal_tx,
             outbound_tx,
@@ -238,10 +238,15 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         }
     }
 
-    fn send_to(&self, peer_id: u64, event: impl Into<Outbound>) {
+    fn send(&self, event: impl Into<Outbound>) {
         let msg = event.into();
-        debug!("[Node {}] -> [Node {}] {:?}", self.node_id, peer_id, msg);
-        let _ = self.outbound_tx.send((peer_id, msg));
+        debug!("[Node {}] -> {:?}", self.node_id, msg);
+        let _ = self.outbound_tx.send(msg);
+    }
+
+    fn send_to(&self, peer_id: u64, event: impl Into<Protocol>) {
+        let msg = event.into();
+        self.send(Outbound::MessageToPeer(peer_id, msg));
     }
 
     fn get_last_log_index(&self) -> u64 {
@@ -319,14 +324,12 @@ impl<Provider: DependencyProvider> Runner<Provider> {
             let log_index = (self.last_applied - self.last_included_index) as usize;
 
             if let Some(entry) = self.log.get(log_index) {
-                self.send_to(
-                    self.node_id,
-                    CommitNotification {
-                        index: self.last_applied + 1,
-                        term: entry.term,
-                        request: entry.request.clone(),
-                    },
-                );
+                self.send(CommitNotification {
+                    node_id: self.node_id,
+                    index: self.last_applied + 1,
+                    term: entry.term,
+                    request: entry.request.clone(),
+                });
                 self.last_applied += 1;
             } else {
                 break;
@@ -356,19 +359,16 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         self.next_index.clear();
         self.match_index.clear();
         self.stop_election_timer();
-        self.send_to(
-            self.node_id,
-            NetworkUpdateInd {
-                leader_id: self.node_id,
-            },
-        );
+        self.send(NetworkUpdateInd {
+            leader_id: self.node_id,
+        });
 
-        for node_id in 1..=self.num_nodes {
-            if node_id != self.node_id {
-                self.next_backoff_index.insert(node_id, 1);
+        for node_id in &self.node_pool {
+            if *node_id != self.node_id {
+                self.next_backoff_index.insert(*node_id, 1);
                 self.next_index
-                    .insert(node_id, self.get_last_log_index() + 1);
-                self.match_index.insert(node_id, 0);
+                    .insert(*node_id, self.get_last_log_index() + 1);
+                self.match_index.insert(*node_id, 0);
             }
         }
         self.broadcast_heartbeat();
@@ -381,11 +381,11 @@ impl<Provider: DependencyProvider> Runner<Provider> {
     }
 
     fn broadcast_heartbeat(&mut self) {
-        for node_id in 1..=self.num_nodes {
-            if node_id != self.node_id {
+        for node_id in &self.node_pool {
+            if *node_id != self.node_id {
                 let _ = self
                     .internal_tx
-                    .send(Inbound::InitiateHeartbeat(InitiateHeartbeat(node_id)));
+                    .send(Inbound::InitiateHeartbeat(InitiateHeartbeat(*node_id)));
             }
         }
     }
@@ -484,8 +484,8 @@ impl<Provider: DependencyProvider> OnEvent<InitiateHeartbeat> for Runner<Provide
                 AppendEntries {
                     term: self.current_term,
                     leader_id: self.node_id,
-                    prev_log_index: prev_log_index,
-                    prev_log_term: prev_log_term,
+                    prev_log_index,
+                    prev_log_term,
                     entries,
                     leader_commit: self.commit_index,
                 },
@@ -515,12 +515,12 @@ impl<Provider: DependencyProvider> OnEvent<InitiateElection> for Runner<Provider
         let rv = RequestVote {
             term: self.current_term,
             candidate_id: self.node_id,
-            last_log_index: last_log_index,
+            last_log_index,
             last_log_term: self.get_log_term(last_log_index),
         };
-        for node_id in 1..=self.num_nodes {
-            if node_id != self.node_id {
-                self.send_to(node_id, rv.clone());
+        for node_id in &self.node_pool {
+            if *node_id != self.node_id {
+                self.send_to(*node_id, rv.clone());
             }
         }
         self.start_election_timer();
@@ -681,7 +681,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
         if truncate_from < self.log.len() {
             self.log.drain(truncate_from..);
         }
-        self.log.extend(event.entries.into_iter());
+        self.log.extend(event.entries);
 
         self.commit_index = std::cmp::max(self.commit_index, event.leader_commit);
         self.advance_commit_index();
@@ -776,13 +776,11 @@ impl<Provider: DependencyProvider> OnEvent<StateUpdateRequest> for Runner<Provid
         self.log.drain(0..remove);
         self.snapshot = Some(event.data);
 
-        self.send_to(
-            self.node_id,
-            StateUpdateResponse {
-                included_index: self.last_included_index,
-                included_term: self.last_included_term,
-            },
-        );
+        self.send(StateUpdateResponse {
+            node_id: self.node_id,
+            included_index: self.last_included_index,
+            included_term: self.last_included_term,
+        });
     }
 }
 
@@ -819,11 +817,12 @@ impl<Provider: DependencyProvider> OnEvent<InstallSnapshot> for Runner<Provider>
         self.log.clear();
 
         let state_update = StateUpdateCommand {
+            node_id: self.node_id,
             included_index: event.last_included_index,
             included_term: event.last_included_term,
             data: event.data.clone(),
         };
-        self.send_to(self.node_id, state_update);
+        self.send(state_update);
         let resp = InstallSnapshotResponse {
             node_id: self.node_id,
             term: self.current_term,

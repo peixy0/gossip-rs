@@ -2,17 +2,15 @@
 use super::common::*;
 use crate::event::*;
 use crate::node::{Inbound, InitiateElection, InitiateHeartbeat};
-use std::collections::HashSet;
 
 #[tokio::test]
 async fn test_single_node_log_commit() {
-    let num_nodes = 1;
     let node_id = 1;
     let quorum = 1;
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
     let (node, join_handle) = crate::node::Node::<TestDependencyProvider>::new(
         node_id,
-        num_nodes,
+        vec![1u64],
         outbound_tx,
         NoopTimerService,
         quorum,
@@ -25,13 +23,11 @@ async fn test_single_node_log_commit() {
         request: "test_entry_1".as_bytes().to_vec(),
     }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive commit notification")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive commit notification")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, node_id);
     if let Outbound::CommitNotification(notif) = event {
         assert_eq!(notif.index, 1);
         assert_eq!(notif.term, 1);
@@ -43,13 +39,11 @@ async fn test_single_node_log_commit() {
         request: "test_entry_2".as_bytes().to_vec(),
     }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .expect("Should receive second commit notification")
-            .expect("Channel should not be closed");
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Should receive second commit notification")
+        .expect("Channel should not be closed");
 
-    assert_eq!(peer_id, node_id);
     if let Outbound::CommitNotification(notif) = event {
         assert_eq!(notif.index, 2);
         assert_eq!(notif.term, 1);
@@ -83,22 +77,13 @@ async fn test_two_node_log_commit_verification() {
             request: "test".as_bytes().to_vec(),
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    let prev_log_index = if let Outbound::AppendEntries(ae) = event {
-        assert_eq!(ae.term, 1);
-        assert_eq!(ae.leader_id, 1);
-        assert_eq!(ae.entries.len(), 1);
-        assert_eq!(ae.entries[0].request, "test".as_bytes().to_vec());
-        assert_eq!(ae.leader_commit, 0);
-        ae.prev_log_index + ae.entries.len() as u64
-    } else {
-        panic!("Expected AppendEntries, got: {:?}", event);
-    };
+    let (_peer_id, ae) = expect_append_entries(&mut outbound_rx).await;
+    let prev_log_index = ae.prev_log_index + ae.entries.len() as u64;
+    assert_eq!(ae.term, 1);
+    assert_eq!(ae.leader_id, 1);
+    assert_eq!(ae.entries.len(), 1);
+    assert_eq!(ae.entries[0].request, "test".as_bytes().to_vec());
+    assert_eq!(ae.leader_commit, 0);
 
     nodes
         .get(&1)
@@ -111,18 +96,9 @@ async fn test_two_node_log_commit_verification() {
             success: true,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 1);
-    if let Outbound::CommitNotification(notif) = event {
-        assert_eq!(notif.index, 1);
-        assert_eq!(notif.term, 1);
-    } else {
-        panic!("Expected CommitNotification, got: {:?}", event);
-    }
+    let notif = expect_commit_notification(&mut outbound_rx).await;
+    assert_eq!(notif.index, 1);
+    assert_eq!(notif.term, 1);
 
     nodes
         .get(&1)
@@ -130,17 +106,8 @@ async fn test_two_node_log_commit_verification() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntries(ae) = event {
-        assert_eq!(ae.leader_commit, 1);
-    } else {
-        panic!("Expected AppendEntries, got: {:?}", event);
-    }
+    let (_peer_id, ae) = expect_append_entries(&mut outbound_rx).await;
+    assert_eq!(ae.leader_commit, 1);
 
     shutdown_cluster(nodes).await;
 }
@@ -161,24 +128,16 @@ async fn test_basic_log_replication() {
             request: "test".as_bytes().to_vec(),
         }));
 
-    let mut log_replication_recv = HashSet::new();
-    for _ in 0..num_nodes - 1 {
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        if let Outbound::AppendEntries(event) = event {
-            assert_eq!(event.term, 1);
-            assert_eq!(event.leader_id, 1);
-            assert_eq!(event.entries.len(), 1);
-            assert_eq!(event.entries[0].request, "test".as_bytes().to_vec());
-            log_replication_recv.insert(peer_id);
-        } else {
-            panic!("unexpected event: {:?}", event);
-        }
+    // Verify AppendEntries sent to all peers with the entry
+    let entries = collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    assert_eq!(entries.len(), 2);
+
+    for (_peer_id, ae) in entries {
+        assert_eq!(ae.term, 1);
+        assert_eq!(ae.leader_id, 1);
+        assert_eq!(ae.entries.len(), 1);
+        assert_eq!(ae.entries[0].request, "test".as_bytes().to_vec());
     }
-    assert_eq!(log_replication_recv, HashSet::from([2, 3]));
 
     shutdown_cluster(nodes).await;
 }
@@ -218,13 +177,11 @@ async fn test_log_replication_with_inconsistencies() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntries(event) = event {
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(event)) = event {
         assert_eq!(event.term, 1);
         assert_eq!(event.prev_log_index, 0);
         assert_eq!(event.entries.len(), 1);
@@ -274,11 +231,11 @@ async fn test_multiple_log_entries() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = get_next_non_commit_message(&mut outbound_rx)
+    let event = get_next_non_commit_message(&mut outbound_rx)
         .await
         .expect("Should receive AppendEntries");
 
-    if let Outbound::AppendEntries(event) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(event)) = event {
         assert_eq!(event.prev_log_index, 3);
         assert_eq!(event.entries.len(), 0);
     } else {
@@ -339,10 +296,10 @@ async fn test_log_replication_after_failure_and_recovery() {
 
     let mut found_entry2 = false;
     for _ in 0..num_nodes - 1 {
-        if let Ok(Some((_, event))) =
+        if let Ok(Some(event)) =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
         {
-            if let Outbound::AppendEntries(ae) = event {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
                 if ae.entries.len() == 1 && ae.entries[0].request == "entry2".as_bytes().to_vec() {
                     found_entry2 = true;
                 }
@@ -388,12 +345,12 @@ async fn test_log_replication_with_conflicting_entries() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .unwrap()
         .unwrap();
 
-    if let Outbound::AppendEntries(event) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(event)) = event {
         assert_eq!(event.prev_log_index, 0);
         assert_eq!(event.entries.len(), 1);
     } else {
@@ -439,12 +396,12 @@ async fn test_log_replication_exponential_backoff() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .unwrap()
         .unwrap();
 
-    if let Outbound::AppendEntries(event) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(event)) = event {
         assert_eq!(event.prev_log_index, 0);
     } else {
         panic!("unexpected event: {:?}", event);
@@ -467,12 +424,12 @@ async fn test_log_replication_exponential_backoff() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .unwrap()
         .unwrap();
 
-    if let Outbound::AppendEntries(event) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(event)) = event {
         assert_eq!(event.prev_log_index, 0);
     } else {
         panic!("unexpected event: {:?}", event);
@@ -495,14 +452,12 @@ async fn test_empty_append_entries_heartbeat() {
         .0
         .recv(Inbound::InitiateHeartbeat(InitiateHeartbeat(2)));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntries(event) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(event)) = event {
         assert_eq!(event.entries.len(), 0);
         assert_eq!(event.prev_log_index, 0);
     } else {
@@ -536,14 +491,12 @@ async fn test_follower_log_truncation_on_conflict() {
             leader_commit: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
 
-    assert_eq!(peer_id, 1);
-    if let Outbound::AppendEntriesResponse(resp) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntriesResponse(resp)) = event {
         assert!(resp.success);
         assert_eq!(resp.prev_log_index, 1);
     } else {

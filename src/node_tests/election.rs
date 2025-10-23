@@ -2,17 +2,15 @@
 use super::common::*;
 use crate::event::*;
 use crate::node::{Inbound, InitiateElection};
-use std::collections::HashSet;
 
 #[tokio::test]
 async fn test_single_node_elect_itself_as_leader() {
-    let num_nodes = 1;
     let node_id = 1;
     let quorum = 1;
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel();
     let (node, join_handle) = crate::node::Node::<TestDependencyProvider>::new(
         node_id,
-        num_nodes,
+        vec![1u64],
         outbound_tx,
         NoopTimerService,
         quorum,
@@ -37,49 +35,16 @@ async fn test_three_node_cluster_elect_leader() {
         .0
         .recv(Inbound::InitiateElection(InitiateElection));
 
-    let mut request_vote_recv = HashSet::new();
-    for _ in 0..num_nodes - 1 {
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        if let Outbound::RequestVote(event) = event {
-            assert_eq!(event.term, 1);
-            assert_eq!(event.candidate_id, 1);
-            request_vote_recv.insert(peer_id);
-        } else {
-            panic!("unexpected event: {:?}", event);
-        }
-    }
-    assert_eq!(request_vote_recv, HashSet::from([2, 3]));
+    // Verify RequestVote messages sent to all peers
+    assert_request_votes_sent(&mut outbound_rx, &[2, 3], 1, 1).await;
 
-    for i in 2..=num_nodes {
-        nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-            term: 1,
-            voter_id: i,
-            granted: true,
-        }));
-    }
+    // Send votes from all peers
+    send_votes(&nodes, 1, &[2, 3], 1, true);
 
     expect_leader_elected(1, &mut outbound_rx).await;
 
-    let mut heartbeat_recv = HashSet::new();
-    for _ in 0..num_nodes - 1 {
-        let (peer_id, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        if let Outbound::AppendEntries(event) = event {
-            assert_eq!(event.term, 1);
-            assert_eq!(event.leader_id, 1);
-            heartbeat_recv.insert(peer_id);
-        } else {
-            panic!("unexpected event: {:?}", event);
-        }
-    }
-    assert_eq!(heartbeat_recv, HashSet::from([2, 3]));
+    // Verify heartbeats sent to all peers
+    assert_heartbeats_sent(&mut outbound_rx, &[2, 3], 1, 1).await;
 
     shutdown_cluster(nodes).await;
 }
@@ -96,36 +61,14 @@ async fn test_leader_election_failure() {
         .0
         .recv(Inbound::InitiateElection(InitiateElection));
 
-    for _ in 0..num_nodes - 1 {
-        let (_, event) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        if let Outbound::RequestVote(event) = event {
-            assert_eq!(event.term, 1);
-            assert_eq!(event.candidate_id, 1);
-        } else {
-            panic!("unexpected event: {:?}", event);
-        }
-    }
+    // Verify RequestVote messages sent
+    assert_request_votes_sent(&mut outbound_rx, &[2, 3], 1, 1).await;
 
-    nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-        term: 1,
-        voter_id: 2,
-        granted: false,
-    }));
-    nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-        term: 1,
-        voter_id: 3,
-        granted: false,
-    }));
+    // All votes are rejected
+    send_votes(&nodes, 1, &[2, 3], 1, false);
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    // No leader should be elected
+    assert_no_message(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
 
     shutdown_cluster(nodes).await;
 }
@@ -157,21 +100,10 @@ async fn test_candidate_receives_append_entries_and_becomes_follower() {
             leader_commit: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntriesResponse(resp) = event {
-        assert!(resp.success);
-        assert_eq!(resp.term, 1);
-    } else {
-        panic!(
-            "unexpected event, expected AppendEntriesResponse: {:?}",
-            event
-        );
-    }
+    // Expect AppendEntriesResponse
+    let (_peer_id, resp) = expect_append_entries_response(&mut outbound_rx).await;
+    assert!(resp.success);
+    assert_eq!(resp.term, 1);
 
     shutdown_cluster(nodes).await;
 }
@@ -190,6 +122,7 @@ async fn test_split_vote_scenario() {
 
     drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
+    // One vote granted, one rejected - not enough for quorum
     nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
         term: 1,
         voter_id: 2,
@@ -201,11 +134,8 @@ async fn test_split_vote_scenario() {
         granted: false,
     }));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    // No leader should be elected
+    assert_no_message(&mut outbound_rx, tokio::time::Duration::from_millis(100)).await;
 
     shutdown_cluster(nodes).await;
 }
@@ -224,17 +154,15 @@ async fn test_candidate_receives_higher_term_vote() {
 
     drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
+    // Receive vote with higher term
     nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
         term: 2,
         voter_id: 2,
         granted: false,
     }));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    // No leader should be elected
+    assert_no_message(&mut outbound_rx, tokio::time::Duration::from_millis(100)).await;
 
     shutdown_cluster(nodes).await;
 }
@@ -253,30 +181,14 @@ async fn test_exact_quorum_vote() {
 
     drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
-    nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-        term: 1,
-        voter_id: 2,
-        granted: true,
-    }));
-    nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
-        term: 1,
-        voter_id: 3,
-        granted: true,
-    }));
+    // Exactly quorum votes (including self)
+    send_votes(&nodes, 1, &[2, 3], 1, true);
 
     expect_leader_elected(1, &mut outbound_rx).await;
 
-    let mut heartbeat_count = 0;
-    for _ in 0..num_nodes - 1 {
-        if let Ok(Some((_, event))) =
-            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
-        {
-            if let Outbound::AppendEntries(_) = event {
-                heartbeat_count += 1;
-            }
-        }
-    }
-    assert_eq!(heartbeat_count, 4);
+    // Verify heartbeats sent to all peers
+    let heartbeats = collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    assert_eq!(heartbeats.len(), 4);
 
     shutdown_cluster(nodes).await;
 }
@@ -302,18 +214,10 @@ async fn test_leader_receives_append_entries_from_higher_term() {
             leader_commit: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntriesResponse(resp) = event {
-        assert!(resp.success);
-        assert_eq!(resp.term, 2);
-    } else {
-        panic!("unexpected event: {:?}", event);
-    }
+    // Expect AppendEntriesResponse with higher term
+    let (_peer_id, resp) = expect_append_entries_response(&mut outbound_rx).await;
+    assert!(resp.success);
+    assert_eq!(resp.term, 2);
 
     shutdown_cluster(nodes).await;
 }

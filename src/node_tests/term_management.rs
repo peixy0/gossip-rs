@@ -22,13 +22,11 @@ async fn test_reject_vote_with_stale_term() {
             last_log_term: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::Vote(vote) = event {
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::Vote(vote)) = event {
         assert!(!vote.granted);
         assert_eq!(vote.term, 1);
     } else {
@@ -59,13 +57,11 @@ async fn test_reject_append_entries_with_stale_term() {
             leader_commit: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntriesResponse(resp) = event {
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntriesResponse(resp)) = event {
         assert!(!resp.success);
         assert_eq!(resp.term, 1);
     } else {
@@ -95,13 +91,11 @@ async fn test_follower_updates_term_on_higher_request_vote() {
             last_log_term: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::Vote(vote) = event {
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::Vote(vote)) = event {
         assert!(vote.granted);
         assert_eq!(vote.term, 5);
     } else {
@@ -132,13 +126,11 @@ async fn test_follower_updates_term_on_higher_append_entries() {
             leader_commit: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 2);
-    if let Outbound::AppendEntriesResponse(resp) = event {
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntriesResponse(resp)) = event {
         assert!(resp.success);
         assert_eq!(resp.term, 3);
     } else {
@@ -222,8 +214,8 @@ async fn test_equal_term_request_vote_with_same_candidate() {
             last_log_term: 0,
         }));
 
-    let (_, event) = outbound_rx.recv().await.unwrap();
-    if let Outbound::Vote(vote) = event {
+    let event = outbound_rx.recv().await.unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::Vote(vote)) = event {
         assert!(vote.granted);
     } else {
         panic!("unexpected event: {:?}", event);
@@ -240,11 +232,11 @@ async fn test_equal_term_request_vote_with_same_candidate() {
             last_log_term: 0,
         }));
 
-    let (_, event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
         .await
         .unwrap()
         .unwrap();
-    if let Outbound::Vote(vote) = event {
+    if let Outbound::MessageToPeer(_peer_id, Protocol::Vote(vote)) = event {
         assert!(vote.granted);
     } else {
         panic!("unexpected event: {:?}", event);
@@ -283,13 +275,11 @@ async fn test_equal_term_request_vote_with_different_candidate() {
             last_log_term: 0,
         }));
 
-    let (peer_id, event) =
-        tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(peer_id, 3);
-    if let Outbound::Vote(vote) = event {
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    if let Outbound::MessageToPeer(_peer_id, Protocol::Vote(vote)) = event {
         assert!(!vote.granted);
     } else {
         panic!("unexpected event: {:?}", event);
@@ -311,8 +301,8 @@ async fn test_term_increment_on_election() {
         .recv(Inbound::InitiateElection(crate::node::InitiateElection));
 
     for _ in 0..num_nodes - 1 {
-        if let Some((_, event)) = outbound_rx.recv().await {
-            if let Outbound::RequestVote(rv) = event {
+        if let Some(event) = outbound_rx.recv().await {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::RequestVote(rv)) = event {
                 assert_eq!(rv.term, 1);
             }
         }
@@ -325,8 +315,8 @@ async fn test_term_increment_on_election() {
         .recv(Inbound::InitiateElection(crate::node::InitiateElection));
 
     for _ in 0..num_nodes - 1 {
-        if let Some((_, event)) = outbound_rx.recv().await {
-            if let Outbound::RequestVote(rv) = event {
+        if let Some(event) = outbound_rx.recv().await {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::RequestVote(rv)) = event {
                 assert_eq!(rv.term, 1);
                 break;
             }

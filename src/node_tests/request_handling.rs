@@ -11,6 +11,7 @@ async fn test_follower_drops_client_request() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make follower aware of leader
     nodes
         .get(&2)
         .unwrap()
@@ -25,6 +26,7 @@ async fn test_follower_drops_client_request() {
         }));
     let _ = outbound_rx.recv().await;
 
+    // Follower receives request - should drop it
     nodes
         .get(&2)
         .unwrap()
@@ -33,11 +35,7 @@ async fn test_follower_drops_client_request() {
             request: "test".as_bytes().to_vec(),
         }));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    assert_no_message(&mut outbound_rx, tokio::time::Duration::from_millis(100)).await;
     shutdown_cluster(nodes).await;
 }
 
@@ -59,10 +57,10 @@ async fn test_leader_handles_request_directly() {
 
     let mut found_append_entries = 0;
     for _ in 0..num_nodes - 1 {
-        if let Ok(Some((_, event))) =
+        if let Ok(Some(event)) =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
         {
-            if let Outbound::AppendEntries(ae) = event {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
                 if ae.entries.len() == 1
                     && ae.entries[0].request == "leader_request".as_bytes().to_vec()
                 {
@@ -82,6 +80,7 @@ async fn test_follower_without_known_leader_drops_request() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
+    // Follower has no leader - should drop request
     nodes
         .get(&2)
         .unwrap()
@@ -90,11 +89,7 @@ async fn test_follower_without_known_leader_drops_request() {
             request: "lost_request".as_bytes().to_vec(),
         }));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    assert_no_message(&mut outbound_rx, tokio::time::Duration::from_millis(100)).await;
 
     shutdown_cluster(nodes).await;
 }
@@ -119,10 +114,10 @@ async fn test_multiple_concurrent_requests_to_leader() {
 
     let mut requests_found = std::collections::HashSet::new();
     for _ in 0..(5 * (num_nodes - 1)) {
-        if let Ok(Some((_, event))) =
+        if let Ok(Some(event)) =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
         {
-            if let Outbound::AppendEntries(ae) = event {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
                 for entry in ae.entries {
                     requests_found.insert(entry.request);
                 }
@@ -149,6 +144,7 @@ async fn test_request_during_leader_transition() {
 
     elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
 
+    // Make follower aware of leader
     nodes
         .get(&2)
         .unwrap()
@@ -163,6 +159,7 @@ async fn test_request_during_leader_transition() {
         }));
     drain_messages(&mut outbound_rx, 1).await;
 
+    // Request during transition - follower should drop it
     nodes
         .get(&2)
         .unwrap()
@@ -171,11 +168,7 @@ async fn test_request_during_leader_transition() {
             request: "during_transition".as_bytes().to_vec(),
         }));
 
-    assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(100), outbound_rx.recv())
-            .await
-            .is_err()
-    );
+    assert_no_message(&mut outbound_rx, tokio::time::Duration::from_millis(100)).await;
 
     shutdown_cluster(nodes).await;
 }
@@ -198,10 +191,10 @@ async fn test_request_with_empty_payload() {
 
     let mut found = false;
     for _ in 0..num_nodes - 1 {
-        if let Ok(Some((_, event))) =
+        if let Ok(Some(event)) =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
         {
-            if let Outbound::AppendEntries(ae) = event {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
                 if ae.entries.len() == 1 && ae.entries[0].request.is_empty() {
                     found = true;
                 }
@@ -232,10 +225,10 @@ async fn test_large_request_payload() {
 
     let mut found = false;
     for _ in 0..num_nodes - 1 {
-        if let Ok(Some((_, event))) =
+        if let Ok(Some(event)) =
             tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv()).await
         {
-            if let Outbound::AppendEntries(ae) = event {
+            if let Outbound::MessageToPeer(_peer_id, Protocol::AppendEntries(ae)) = event {
                 if ae.entries.len() == 1
                     && ae.entries[0].request == large_payload.as_bytes().to_vec()
                 {

@@ -39,16 +39,24 @@ async fn main() {
         .init();
 
     // The "Network": A channel that receives all outbound messages from all nodes.
-    let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Outbound)>();
+    let (network_tx, mut network_rx) = tokio::sync::mpsc::unbounded_channel::<Outbound>();
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel::<MakeRequest>();
 
+    let node_pool: Vec<u64> = (1..=NUM_NODES).collect();
     // A place to store handles to our running nodes.
     let mut nodes: HashMap<u64, Node<DefaultDependencyProvider>> = HashMap::new();
 
     // Create and start all the Raft nodes.
-    for i in 1..=NUM_NODES {
+    for node_id in &node_pool {
         let timer_service = timer::DefaultTimerService;
-        let (node, _handle) = Node::new(i, NUM_NODES, network_tx.clone(), timer_service, QUORUM);
-        nodes.insert(i, node);
+        let (node, _handle) = Node::new(
+            *node_id,
+            node_pool.clone(),
+            network_tx.clone(),
+            timer_service,
+            QUORUM,
+        );
+        nodes.insert(*node_id, node);
     }
 
     let nodes_clone = nodes.clone();
@@ -58,70 +66,75 @@ async fn main() {
     tokio::spawn(async move {
         let mut leader = None;
         let mut committed_count = HashMap::new();
-        while let Some((dest_node_id, message)) = network_rx.recv().await {
-            let node = nodes_clone[&dest_node_id].clone();
-            match message {
-                Outbound::MakeRequest(e) => {
-                    if let Some(leader_id) = leader {
-                        nodes_clone[&leader_id].recv(e);
+        loop {
+            tokio::select! {
+                Some(event) = request_rx.recv() => {
+                    if let Some(leader_id) = &leader {
+                        nodes_clone[leader_id].recv(event);
                     } else {
-                        warn!("[Network] no leader elected, dropping request");
-                    }
-                }
-                Outbound::NetworkUpdateInd(e) => {
-                    leader = Some(e.leader_id);
-                }
-                Outbound::RequestVote(e) => maybe_dispatch_event(node, e),
-                Outbound::Vote(e) => maybe_dispatch_event(node, e),
-                Outbound::AppendEntries(e) => {
-                    maybe_dispatch_event(node, e);
-                }
-                Outbound::AppendEntriesResponse(e) => maybe_dispatch_event(node, e),
-                Outbound::InstallSnapshot(e) => {
-                    maybe_dispatch_event(node, e);
-                }
-                Outbound::InstallSnapshotResponse(e) => maybe_dispatch_event(node, e),
-                Outbound::CommitNotification(e) => {
-                    info!(
-                        "[Node {}] commit request index {} term {} {}",
-                        dest_node_id,
-                        e.index,
-                        e.term,
-                        String::from_utf8(e.request).unwrap()
-                    );
-
-                    let count = committed_count.entry(dest_node_id).or_default();
-                    *count += 1;
-                    let current_commit_index = e.index;
-
-                    if *count >= SNAPSHOT_THRESHOLD {
-                        let snapshot_data = format!("snapshot_up_to_{}", current_commit_index)
-                            .as_bytes()
-                            .to_vec();
-                        info!(
-                            "[Compaction] triggering compaction {}",
-                            String::from_utf8(snapshot_data.clone()).unwrap()
+                        warn!(
+                            "[Network] dropping request {:?}, leader not elected",
+                             String::from_utf8(event.request).unwrap()
                         );
-                        *count = 0;
-
-                        nodes_clone[&dest_node_id].recv(StateUpdateRequest {
-                            included_index: current_commit_index,
-                            data: snapshot_data.clone(),
-                        });
                     }
-                }
-                Outbound::StateUpdateResponse(e) => {
-                    info!(
-                        "[Node {}] snapshot created at index {} term {}",
-                        dest_node_id, e.included_index, e.included_term,
-                    );
-                }
-                Outbound::StateUpdateCommand(e) => {
-                    info!(
-                        "[Node {}] commit snapshot {}",
-                        dest_node_id,
-                        String::from_utf8(e.data).unwrap(),
-                    );
+                },
+                Some(message) = network_rx.recv() => {
+                    match message {
+                        Outbound::NetworkUpdateInd(e) => {
+                            leader = Some(e.leader_id);
+                        }
+                        Outbound::MessageToPeer(dest_node_id, protocol) => {
+                            let node = nodes_clone[&dest_node_id].clone();
+                            match protocol {
+                                Protocol::RequestVote(e) => maybe_dispatch_event(node, e),
+                                Protocol::Vote(e) => maybe_dispatch_event(node, e),
+                                Protocol::AppendEntries(e) => maybe_dispatch_event(node, e),
+                                Protocol::AppendEntriesResponse(e) => maybe_dispatch_event(node, e),
+                                Protocol::InstallSnapshot(e) => maybe_dispatch_event(node, e),
+                                Protocol::InstallSnapshotResponse(e) => maybe_dispatch_event(node, e),
+                            }
+                        }
+                        Outbound::CommitNotification(e) => {
+                            info!(
+                                "[Commit] request index {} term {} {}",
+                                e.index,
+                                e.term,
+                                String::from_utf8(e.request).unwrap()
+                            );
+
+                            let count = committed_count.entry(e.node_id).or_default();
+                            *count += 1;
+                            let current_commit_index = e.index;
+
+                            if *count >= SNAPSHOT_THRESHOLD {
+                                let snapshot_data = format!("snapshot_up_to_{}", current_commit_index)
+                                    .as_bytes()
+                                    .to_vec();
+                                info!(
+                                    "[Compaction] triggering compaction {}",
+                                    String::from_utf8(snapshot_data.clone()).unwrap()
+                                );
+                                *count = 0;
+
+                                nodes_clone[&e.node_id].recv(StateUpdateRequest {
+                                    included_index: current_commit_index,
+                                    data: snapshot_data.clone(),
+                                });
+                            }
+                        }
+                        Outbound::StateUpdateResponse(e) => {
+                            info!(
+                                "[Snapshot] snapshot created {:?}",
+                                e,
+                            );
+                        }
+                        Outbound::StateUpdateCommand(e) => {
+                            info!(
+                                "[Snapshot] commit snapshot {} {:?}",
+                                String::from_utf8(e.data.clone()).unwrap(), e,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -136,7 +149,7 @@ async fn main() {
             let request = MakeRequest {
                 request: format!("Request-{}", request_id).as_bytes().to_vec(),
             };
-            let _ = network_tx.send((request_id % NUM_NODES + 1, request.into()));
+            let _ = request_tx.send(request);
             request_id += 1;
         }
     });

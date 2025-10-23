@@ -22,12 +22,14 @@ pub struct StateUpdateRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateUpdateResponse {
+    pub node_id: u64,
     pub included_index: u64,
     pub included_term: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StateUpdateCommand {
+    pub node_id: u64,
     pub included_index: u64,
     pub included_term: u64,
     pub data: Vec<u8>,
@@ -83,89 +85,88 @@ pub struct InstallSnapshotResponse {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommitNotification {
+    pub node_id: u64,
     pub index: u64,
     pub term: u64,
     pub request: Vec<u8>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum Outbound {
-    MakeRequest(MakeRequest),
-    NetworkUpdateInd(NetworkUpdateInd),
+pub enum Protocol {
     RequestVote(RequestVote),
     Vote(Vote),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
     InstallSnapshot(InstallSnapshot),
     InstallSnapshotResponse(InstallSnapshotResponse),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Outbound {
+    NetworkUpdateInd(NetworkUpdateInd),
     CommitNotification(CommitNotification),
     StateUpdateResponse(StateUpdateResponse),
     StateUpdateCommand(StateUpdateCommand),
+    MessageToPeer(u64, Protocol),
 }
 
-impl Into<Outbound> for MakeRequest {
-    fn into(self) -> Outbound {
-        Outbound::MakeRequest(self)
+impl From<NetworkUpdateInd> for Outbound {
+    fn from(val: NetworkUpdateInd) -> Self {
+        Outbound::NetworkUpdateInd(val)
     }
 }
 
-impl Into<Outbound> for NetworkUpdateInd {
-    fn into(self) -> Outbound {
-        Outbound::NetworkUpdateInd(self)
+impl From<CommitNotification> for Outbound {
+    fn from(val: CommitNotification) -> Self {
+        Outbound::CommitNotification(val)
     }
 }
 
-impl Into<Outbound> for RequestVote {
-    fn into(self) -> Outbound {
-        Outbound::RequestVote(self)
+impl From<StateUpdateResponse> for Outbound {
+    fn from(val: StateUpdateResponse) -> Self {
+        Outbound::StateUpdateResponse(val)
     }
 }
 
-impl Into<Outbound> for Vote {
-    fn into(self) -> Outbound {
-        Outbound::Vote(self)
+impl From<StateUpdateCommand> for Outbound {
+    fn from(val: StateUpdateCommand) -> Self {
+        Outbound::StateUpdateCommand(val)
     }
 }
 
-impl Into<Outbound> for AppendEntries {
-    fn into(self) -> Outbound {
-        Outbound::AppendEntries(self)
+impl From<RequestVote> for Protocol {
+    fn from(val: RequestVote) -> Self {
+        Protocol::RequestVote(val)
     }
 }
 
-impl Into<Outbound> for AppendEntriesResponse {
-    fn into(self) -> Outbound {
-        Outbound::AppendEntriesResponse(self)
+impl From<Vote> for Protocol {
+    fn from(val: Vote) -> Self {
+        Protocol::Vote(val)
     }
 }
 
-impl Into<Outbound> for CommitNotification {
-    fn into(self) -> Outbound {
-        Outbound::CommitNotification(self)
+impl From<AppendEntries> for Protocol {
+    fn from(val: AppendEntries) -> Self {
+        Protocol::AppendEntries(val)
     }
 }
 
-impl Into<Outbound> for InstallSnapshot {
-    fn into(self) -> Outbound {
-        Outbound::InstallSnapshot(self)
+impl From<AppendEntriesResponse> for Protocol {
+    fn from(val: AppendEntriesResponse) -> Self {
+        Protocol::AppendEntriesResponse(val)
     }
 }
 
-impl Into<Outbound> for InstallSnapshotResponse {
-    fn into(self) -> Outbound {
-        Outbound::InstallSnapshotResponse(self)
+impl From<InstallSnapshot> for Protocol {
+    fn from(val: InstallSnapshot) -> Self {
+        Protocol::InstallSnapshot(val)
     }
 }
 
-impl Into<Outbound> for StateUpdateResponse {
-    fn into(self) -> Outbound {
-        Outbound::StateUpdateResponse(self)
-    }
-}
-
-impl Into<Outbound> for StateUpdateCommand {
-    fn into(self) -> Outbound {
-        Outbound::StateUpdateCommand(self)
+impl From<InstallSnapshotResponse> for Protocol {
+    fn from(val: InstallSnapshotResponse) -> Self {
+        Protocol::InstallSnapshotResponse(val)
     }
 }
 
