@@ -8,6 +8,7 @@ use tracing::*;
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) enum Role {
     Follower,
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -25,6 +26,8 @@ pub(crate) enum Inbound {
     StateUpdateRequest(StateUpdateRequest),
     InstallSnapshot(InstallSnapshot),
     InstallSnapshotResponse(InstallSnapshotResponse),
+    RequestPreVote(RequestPreVote),
+    PreVote(PreVote),
     RequestVote(RequestVote),
     Vote(Vote),
     AppendEntries(AppendEntries),
@@ -65,6 +68,8 @@ impl<Provider: DependencyProvider + 'static> Node<Provider> {
         outbound_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
         timer_service: Provider::TimerService,
         quorum: u64,
+        heartbeat_timeout: tokio::time::Duration,
+        election_timeout_base: tokio::time::Duration,
     ) -> (Self, JoinHandle) {
         let (runner_tx, runner_rx) = tokio::sync::mpsc::unbounded_channel();
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
@@ -76,6 +81,8 @@ impl<Provider: DependencyProvider + 'static> Node<Provider> {
             outbound_tx,
             timer_service,
             quorum,
+            heartbeat_timeout,
+            election_timeout_base,
         );
         tokio::spawn(async move {
             runner.run_eventloop().await;
@@ -97,6 +104,18 @@ impl<Provider: DependencyProvider + 'static> Node<Provider> {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Inbound::Shutdown);
+    }
+}
+
+impl<Provider> Recv<RequestPreVote> for Node<Provider> {
+    fn recv(&self, event: RequestPreVote) {
+        let _ = self.tx.send(Inbound::RequestPreVote(event));
+    }
+}
+
+impl<Provider> Recv<PreVote> for Node<Provider> {
+    fn recv(&self, event: PreVote) {
+        let _ = self.tx.send(Inbound::PreVote(event));
     }
 }
 
@@ -187,16 +206,17 @@ struct Runner<Provider: DependencyProvider> {
     next_index: HashMap<u64, u64>,
     match_index: HashMap<u64, u64>,
 
-    heartbeat_timeout_base_in_ms: u64,
+    heartbeat_timeout: tokio::time::Duration,
     heartbeat_timer: HashMap<
         u64,
         Option<<<Provider as DependencyProvider>::TimerService as timer::TimerService>::Timer>,
     >,
-    election_timeout_base_in_ms: u64,
+    election_timeout_base: tokio::time::Duration,
     election_timer:
         Option<<<Provider as DependencyProvider>::TimerService as timer::TimerService>::Timer>,
 
     votes_collected: HashSet<u64>,
+    pre_votes_collected: HashSet<u64>,
     quorum: u64,
 }
 
@@ -209,6 +229,8 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         outbound_tx: tokio::sync::mpsc::UnboundedSender<Outbound>,
         timer_service: Provider::TimerService,
         quorum: u64,
+        heartbeat_timeout: tokio::time::Duration,
+        election_timeout_base: tokio::time::Duration,
     ) -> Self {
         Self {
             node_id,
@@ -229,11 +251,12 @@ impl<Provider: DependencyProvider> Runner<Provider> {
             next_backoff_index: HashMap::new(),
             next_index: HashMap::new(),
             match_index: HashMap::new(),
-            heartbeat_timeout_base_in_ms: 1000,
+            heartbeat_timeout,
             heartbeat_timer: HashMap::new(),
-            election_timeout_base_in_ms: 5000,
+            election_timeout_base,
             election_timer: None,
             votes_collected: HashSet::new(),
+            pre_votes_collected: HashSet::new(),
             quorum,
         }
     }
@@ -276,7 +299,7 @@ impl<Provider: DependencyProvider> Runner<Provider> {
 
     fn start_heartbeat_timer(&mut self, node_id: u64) {
         let tx = self.internal_tx.clone();
-        let timeout = tokio::time::Duration::from_millis(self.heartbeat_timeout_base_in_ms);
+        let timeout = self.heartbeat_timeout;
         self.heartbeat_timer
             .entry(node_id)
             .or_default()
@@ -291,8 +314,8 @@ impl<Provider: DependencyProvider> Runner<Provider> {
 
     fn start_election_timer(&mut self) {
         let tx = self.internal_tx.clone();
-        let r = rand::random_range(0..self.election_timeout_base_in_ms);
-        let timeout = tokio::time::Duration::from_millis(self.election_timeout_base_in_ms + r);
+        let r = rand::random_range(0..self.election_timeout_base.as_millis() as u64);
+        let timeout = self.election_timeout_base + tokio::time::Duration::from_millis(r);
         self.election_timer = Some(self.timer_service.create(timeout, async move {
             let _ = tx.send(Inbound::InitiateElection(InitiateElection));
         }));
@@ -337,6 +360,18 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         }
     }
 
+    fn become_pre_candidate(&mut self) {
+        let prev_role = self.role;
+        self.role = Role::PreCandidate;
+        self.pre_votes_collected.clear();
+        self.pre_votes_collected.insert(self.node_id);
+        self.start_election_timer();
+        info!(
+            "[Node {}] role {:?} -> {:?}",
+            self.node_id, prev_role, self.role
+        );
+    }
+
     fn become_candidate(&mut self) {
         let prev_role = self.role;
         self.role = Role::Candidate;
@@ -344,7 +379,6 @@ impl<Provider: DependencyProvider> Runner<Provider> {
         self.voted_for = Some(self.node_id);
         self.votes_collected.clear();
         self.votes_collected.insert(self.node_id);
-        self.stop_election_timer();
         self.start_election_timer();
         info!(
             "[Node {}] role {:?} -> {:?}",
@@ -413,6 +447,8 @@ impl<Provider: DependencyProvider> EventLoop<Inbound> for Runner<Provider> {
                 Inbound::MakeRequest(e) => self.on_event(e),
                 Inbound::InitiateHeartbeat(e) => self.on_event(e),
                 Inbound::InitiateElection(e) => self.on_event(e),
+                Inbound::RequestPreVote(e) => self.on_event(e),
+                Inbound::PreVote(e) => self.on_event(e),
                 Inbound::RequestVote(e) => self.on_event(e),
                 Inbound::Vote(e) => self.on_event(e),
                 Inbound::AppendEntries(e) => self.on_event(e),
@@ -499,21 +535,23 @@ impl<Provider: DependencyProvider> OnEvent<InitiateElection> for Runner<Provider
     fn on_event(&mut self, event: InitiateElection) {
         debug!("[Node {}] <- {:?}", self.node_id, event);
 
-        self.become_candidate();
+        self.become_pre_candidate();
 
-        // Check if we already have quorum (single-node clusters)
-        if self.votes_collected.len() >= self.quorum as usize {
+        if self.pre_votes_collected.len() >= self.quorum as usize {
             info!(
-                "[Node {}] won election for term {} (single-node cluster)",
-                self.node_id, self.current_term
+                "[Node {}] won pre-vote for term {} (single-node cluster), proceeding to real election",
+                self.node_id,
+                self.current_term + 1
             );
+            self.current_term += 1;
+            self.voted_for = Some(self.node_id);
             self.become_leader();
             return;
         }
 
         let last_log_index = self.get_last_log_index();
-        let rv = RequestVote {
-            term: self.current_term,
+        let rv = RequestPreVote {
+            term: self.current_term + 1,
             candidate_id: self.node_id,
             last_log_index,
             last_log_term: self.get_log_term(last_log_index),
@@ -524,6 +562,94 @@ impl<Provider: DependencyProvider> OnEvent<InitiateElection> for Runner<Provider
             }
         }
         self.start_election_timer();
+    }
+}
+
+impl<Provider: DependencyProvider> OnEvent<RequestPreVote> for Runner<Provider> {
+    fn on_event(&mut self, event: RequestPreVote) {
+        debug!("[Node {}] <- {:?}", self.node_id, event);
+
+        // Pre-vote doesn't update term - that's the key difference
+        // We only grant pre-vote if:
+        // 1. The candidate's term is >= our current term
+        // 2. The candidate's log is at least as up-to-date as ours
+        // 3. We haven't heard from a leader recently (implicitly checked via role)
+
+        let last_log_index = self.get_last_log_index();
+        let last_log_term = self.get_log_term(last_log_index);
+        let log_ok = event.last_log_term > last_log_term
+            || (event.last_log_term == last_log_term && event.last_log_index >= last_log_index);
+
+        let grant_pre_vote = log_ok && event.term > self.current_term;
+
+        let reply = PreVote {
+            term: event.term,
+            voter_id: self.node_id,
+            granted: grant_pre_vote,
+        };
+
+        self.send_to(event.candidate_id, reply);
+    }
+}
+
+impl<Provider: DependencyProvider> OnEvent<PreVote> for Runner<Provider> {
+    fn on_event(&mut self, event: PreVote) {
+        debug!("[Node {}] <- {:?}", self.node_id, event);
+
+        if event.term > self.current_term + 1 {
+            info!(
+                "[Node {}] term {} > current_term {}",
+                self.node_id, event.term, self.current_term
+            );
+            self.become_follower(event.term);
+            self.start_election_timer();
+            return;
+        }
+
+        if event.term <= self.current_term {
+            debug!(
+                "[Node {}] dropping event, term {} < current_term {}",
+                self.node_id, event.term, self.current_term
+            );
+            return;
+        }
+
+        if self.role != Role::PreCandidate {
+            debug!(
+                "[Node {}] dropping event, role {:?}",
+                self.node_id, self.role
+            );
+            return;
+        }
+
+        if event.granted {
+            self.pre_votes_collected.insert(event.voter_id);
+            debug!(
+                "[Node {}] current pre-votes {}",
+                self.node_id,
+                self.pre_votes_collected.len()
+            );
+            if self.pre_votes_collected.len() >= self.quorum as usize {
+                self.become_candidate();
+                info!(
+                    "[Node {}] won pre-vote, starting real election for term {}",
+                    self.node_id, self.current_term
+                );
+
+                let last_log_index = self.get_last_log_index();
+                let rv = RequestVote {
+                    term: self.current_term,
+                    candidate_id: self.node_id,
+                    last_log_index,
+                    last_log_term: self.get_log_term(last_log_index),
+                };
+                for node_id in &self.node_pool {
+                    if *node_id != self.node_id {
+                        self.send_to(*node_id, rv.clone());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -632,6 +758,20 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             return;
         }
 
+        self.current_term = event.term;
+
+        match self.role {
+            Role::Leader | Role::Candidate | Role::PreCandidate => {
+                info!(
+                    "[Node {}] stepping down from {:?} for term {}",
+                    self.node_id, self.role, self.current_term
+                );
+                self.become_follower(self.current_term);
+            }
+            _ => {}
+        }
+        self.start_election_timer();
+
         if event.prev_log_index < self.last_included_index {
             debug!(
                 "[Node {}] rejecting event, prev_log_index {} < last_included_index {}",
@@ -662,20 +802,6 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             self.send_to(event.leader_id, resp);
             return;
         }
-
-        self.current_term = event.term;
-
-        match self.role {
-            Role::Leader | Role::Candidate => {
-                info!(
-                    "[Node {}] lost election for term {}",
-                    self.node_id, self.current_term
-                );
-                self.become_follower(self.current_term);
-            }
-            _ => {}
-        }
-        self.start_election_timer();
 
         let truncate_from = (event.prev_log_index - self.last_included_index) as usize;
         if truncate_from < self.log.len() {

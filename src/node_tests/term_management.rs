@@ -9,7 +9,7 @@ async fn test_reject_vote_with_stale_term() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -42,7 +42,7 @@ async fn test_reject_append_entries_with_stale_term() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -111,7 +111,7 @@ async fn test_follower_updates_term_on_higher_append_entries() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -146,7 +146,7 @@ async fn test_leader_steps_down_on_higher_term_append_entries_response() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -180,7 +180,8 @@ async fn test_candidate_steps_down_on_higher_term_vote() {
         .0
         .recv(Inbound::InitiateElection(crate::node::InitiateElection));
 
-    drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    // Collect pre-vote messages
+    collect_request_prevotes(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
     nodes.get(&1).unwrap().0.recv(Inbound::Vote(Vote {
         term: 5,
@@ -214,7 +215,10 @@ async fn test_equal_term_request_vote_with_same_candidate() {
             last_log_term: 0,
         }));
 
-    let event = outbound_rx.recv().await.unwrap();
+    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Timeout waiting for response")
+        .expect("Channel closed unexpectedly");
     if let Outbound::MessageToPeer(_peer_id, Protocol::Vote(vote)) = event {
         assert!(vote.granted);
     } else {
@@ -262,7 +266,10 @@ async fn test_equal_term_request_vote_with_different_candidate() {
             last_log_term: 0,
         }));
 
-    let _ = outbound_rx.recv().await;
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+        .await
+        .expect("Timeout waiting for response")
+        .expect("Channel closed unexpectedly");
 
     nodes
         .get(&1)
@@ -301,7 +308,11 @@ async fn test_term_increment_on_election() {
         .recv(Inbound::InitiateElection(crate::node::InitiateElection));
 
     for _ in 0..num_nodes - 1 {
-        if let Some(event) = outbound_rx.recv().await {
+        if let Some(event) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+                .await
+                .expect("Timeout waiting for message")
+        {
             if let Outbound::MessageToPeer(_peer_id, Protocol::RequestVote(rv)) = event {
                 assert_eq!(rv.term, 1);
             }
@@ -315,7 +326,11 @@ async fn test_term_increment_on_election() {
         .recv(Inbound::InitiateElection(crate::node::InitiateElection));
 
     for _ in 0..num_nodes - 1 {
-        if let Some(event) = outbound_rx.recv().await {
+        if let Some(event) =
+            tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
+                .await
+                .expect("Timeout waiting for message")
+        {
             if let Outbound::MessageToPeer(_peer_id, Protocol::RequestVote(rv)) = event {
                 assert_eq!(rv.term, 1);
                 break;

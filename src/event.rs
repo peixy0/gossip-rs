@@ -36,6 +36,21 @@ pub struct StateUpdateCommand {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct RequestPreVote {
+    pub term: u64,
+    pub candidate_id: u64,
+    pub last_log_index: u64,
+    pub last_log_term: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreVote {
+    pub term: u64,
+    pub voter_id: u64,
+    pub granted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct RequestVote {
     pub term: u64,
     pub candidate_id: u64,
@@ -93,6 +108,8 @@ pub struct CommitNotification {
 
 #[derive(Debug, PartialEq)]
 pub enum Protocol {
+    RequestPreVote(RequestPreVote),
+    PreVote(PreVote),
     RequestVote(RequestVote),
     Vote(Vote),
     AppendEntries(AppendEntries),
@@ -131,6 +148,18 @@ impl From<StateUpdateResponse> for Outbound {
 impl From<StateUpdateCommand> for Outbound {
     fn from(val: StateUpdateCommand) -> Self {
         Outbound::StateUpdateCommand(val)
+    }
+}
+
+impl From<RequestPreVote> for Protocol {
+    fn from(val: RequestPreVote) -> Self {
+        Protocol::RequestPreVote(val)
+    }
+}
+
+impl From<PreVote> for Protocol {
+    fn from(val: PreVote) -> Self {
+        Protocol::PreVote(val)
     }
 }
 

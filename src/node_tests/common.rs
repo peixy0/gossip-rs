@@ -4,6 +4,7 @@ use crate::node::{DependencyProvider, Inbound, InitiateElection, Node};
 use crate::timer;
 use std::collections::HashMap;
 use std::future;
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// NoopTimer implementation for deterministic testing
 pub(crate) struct NoopTimer;
@@ -32,6 +33,15 @@ impl DependencyProvider for TestDependencyProvider {
     type TimerService = NoopTimerService;
 }
 
+/// Helper to initialize tracing for debugging
+#[allow(dead_code)]
+pub(crate) fn setup_tracing() {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(EnvFilter::from_default_env())
+        .init();
+}
+
 /// Helper to create a cluster of nodes for testing
 pub(crate) fn create_cluster(
     num_nodes: u64,
@@ -51,6 +61,8 @@ pub(crate) fn create_cluster(
             outbound_tx.clone(),
             NoopTimerService,
             quorum,
+            tokio::time::Duration::from_secs(1),
+            tokio::time::Duration::from_secs(3),
         );
         nodes.insert(*node_id, (node, join_handle));
     }
@@ -58,23 +70,15 @@ pub(crate) fn create_cluster(
     (nodes, outbound_rx)
 }
 
-/// Helper to drain a specific number of messages from the outbound channel
-pub(crate) async fn drain_messages(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
-    count: usize,
-) {
-    for _ in 0..count {
-        let _ = rx.recv().await;
-    }
-}
-
-/// Helper to drain messages, skipping CommitNotification events
 /// This is useful when we want to get to the next non-commit message
 pub(crate) async fn get_next_non_commit_message(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
 ) -> Option<Outbound> {
     loop {
-        if let Some(event) = rx.recv().await {
+        if let Some(event) = tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("Timeout waiting for message in get_next_non_commit_message")
+        {
             match event {
                 Outbound::CommitNotification(_) => continue, // Skip commit notifications
                 _ => return Some(event),
@@ -113,35 +117,44 @@ pub(crate) async fn expect_leader_elected(
 /// Helper to elect a leader by sending votes from all peers
 pub(crate) async fn elect_leader(
     nodes: &HashMap<u64, (Node<TestDependencyProvider>, crate::node::JoinHandle)>,
-    leader_id: u64,
     num_nodes: u64,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
 ) {
     // Initiate election
     nodes
-        .get(&leader_id)
+        .get(&1)
         .unwrap()
         .0
         .recv(Inbound::InitiateElection(InitiateElection));
 
-    // Drain RequestVotes
-    drain_messages(rx, (num_nodes - 1) as usize).await;
+    // Drain RequestPreVotes (new pre-vote phase)
+    collect_request_prevotes(rx, (num_nodes - 1) as usize).await;
 
-    // Send votes
-    for i in 1..=num_nodes {
-        if i != leader_id {
-            nodes.get(&leader_id).unwrap().0.recv(Inbound::Vote(Vote {
-                term: 1,
-                voter_id: i,
-                granted: true,
-            }));
-        }
-    }
+    // Send pre-votes
+    send_prevotes(
+        nodes,
+        1,
+        (2..=num_nodes).collect::<Vec<u64>>().as_slice(),
+        1,
+        true,
+    );
 
-    expect_leader_elected(leader_id, rx).await;
+    // Drain RequestVotes (real vote phase)
+    collect_request_votes(rx, (num_nodes - 1) as usize).await;
+
+    // Send real votes
+    send_votes(
+        nodes,
+        1,
+        (2..=num_nodes).collect::<Vec<u64>>().as_slice(),
+        1,
+        true,
+    );
+
+    expect_leader_elected(1, rx).await;
 
     // Drain heartbeats
-    drain_messages(rx, (num_nodes - 1) as usize).await;
+    collect_append_entries(rx, (num_nodes - 1) as usize).await;
 }
 
 /// Helper to receive and assert a message with timeout
@@ -182,6 +195,24 @@ pub(crate) async fn collect_request_votes(
         }
     }
     votes
+}
+
+/// Helper to collect RequestPreVote messages sent to peers
+/// Returns a HashMap of peer_id -> RequestPreVote event
+pub(crate) async fn collect_request_prevotes(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+    expected_count: usize,
+) -> HashMap<u64, RequestPreVote> {
+    let mut prevotes = HashMap::new();
+    for _ in 0..expected_count {
+        let event = recv_with_timeout(rx, tokio::time::Duration::from_secs(1)).await;
+        if let Outbound::MessageToPeer(peer_id, Protocol::RequestPreVote(rpv)) = event {
+            prevotes.insert(peer_id, rpv);
+        } else {
+            panic!("Expected RequestPreVote, got: {:?}", event);
+        }
+    }
+    prevotes
 }
 
 /// Helper to collect AppendEntries messages sent to peers
@@ -287,6 +318,27 @@ pub(crate) fn send_votes(
     }
 }
 
+/// Helper to send pre-votes to a candidate
+pub(crate) fn send_prevotes(
+    nodes: &HashMap<u64, (Node<TestDependencyProvider>, crate::node::JoinHandle)>,
+    candidate_id: u64,
+    voter_ids: &[u64],
+    term: u64,
+    granted: bool,
+) {
+    for &voter_id in voter_ids {
+        nodes
+            .get(&candidate_id)
+            .unwrap()
+            .0
+            .recv(Inbound::PreVote(PreVote {
+                term,
+                voter_id,
+                granted,
+            }));
+    }
+}
+
 /// Helper to expect a single AppendEntries message
 pub(crate) async fn expect_append_entries(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
@@ -308,6 +360,30 @@ pub(crate) async fn expect_commit_notification(
         notif
     } else {
         panic!("Expected CommitNotification, got: {:?}", event);
+    }
+}
+
+/// Helper to expect a StateUpdateResponse
+pub(crate) async fn expect_state_update_response(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+) -> StateUpdateResponse {
+    let event = recv_with_timeout(rx, tokio::time::Duration::from_secs(1)).await;
+    if let Outbound::StateUpdateResponse(resp) = event {
+        resp
+    } else {
+        panic!("Expected StateUpdateResponse, got: {:?}", event);
+    }
+}
+
+/// Helper to expect a Vote response
+pub(crate) async fn expect_vote(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+) -> (u64, Vote) {
+    let event = recv_with_timeout(rx, tokio::time::Duration::from_secs(1)).await;
+    if let Outbound::MessageToPeer(peer_id, Protocol::Vote(vote)) = event {
+        (peer_id, vote)
+    } else {
+        panic!("Expected Vote, got: {:?}", event);
     }
 }
 
@@ -354,4 +430,30 @@ pub(crate) async fn make_request_and_commit(
     assert_eq!(notif.index, expected_index, "Commit index mismatch");
     assert_eq!(notif.term, expected_term, "Commit term mismatch");
     assert_eq!(notif.request, request, "Commit request mismatch");
+}
+
+/// Helper to make a follower aware of the leader
+pub(crate) async fn make_follower_aware_of_leader(
+    nodes: &HashMap<u64, (Node<TestDependencyProvider>, crate::node::JoinHandle)>,
+    follower_id: u64,
+    leader_id: u64,
+    term: u64,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+) {
+    nodes
+        .get(&follower_id)
+        .unwrap()
+        .0
+        .recv(Inbound::AppendEntries(AppendEntries {
+            term,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![],
+            leader_commit: 0,
+        }));
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), rx.recv())
+        .await
+        .expect("Timeout waiting for AppendEntriesResponse")
+        .expect("Channel closed unexpectedly");
 }

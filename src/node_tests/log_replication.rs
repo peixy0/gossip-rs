@@ -14,6 +14,8 @@ async fn test_single_node_log_commit() {
         outbound_tx,
         NoopTimerService,
         quorum,
+        tokio::time::Duration::from_secs(1),
+        tokio::time::Duration::from_secs(3),
     );
 
     node.recv(Inbound::InitiateElection(InitiateElection));
@@ -67,7 +69,7 @@ async fn test_two_node_log_commit_verification() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -118,7 +120,7 @@ async fn test_basic_log_replication() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -148,7 +150,7 @@ async fn test_log_replication_with_inconsistencies() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -158,7 +160,8 @@ async fn test_log_replication_with_inconsistencies() {
             request: "test".as_bytes().to_vec(),
         }));
 
-    drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    // Collect AppendEntries sent to followers
+    collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
     nodes
         .get(&1)
@@ -199,7 +202,7 @@ async fn test_multiple_log_entries() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     for i in 1..=3 {
         nodes
@@ -209,7 +212,8 @@ async fn test_multiple_log_entries() {
             .recv(Inbound::MakeRequest(MakeRequest {
                 request: format!("request_{}", i).as_bytes().to_vec(),
             }));
-        drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+        // Collect AppendEntries sent to followers for each request
+        collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
     }
 
     for i in 1..=3 {
@@ -251,7 +255,7 @@ async fn test_log_replication_after_failure_and_recovery() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -260,8 +264,11 @@ async fn test_log_replication_after_failure_and_recovery() {
         .recv(Inbound::MakeRequest(MakeRequest {
             request: "entry1".as_bytes().to_vec(),
         }));
-    drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
+    // Collect AppendEntries sent to followers
+    collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
+
+    // Node 2 fails to append (returns false)
     nodes
         .get(&1)
         .unwrap()
@@ -273,8 +280,23 @@ async fn test_log_replication_after_failure_and_recovery() {
             success: false,
         }));
 
-    drain_messages(&mut outbound_rx, 1).await;
+    // Node 3 succeeds, allowing commit
+    nodes
+        .get(&1)
+        .unwrap()
+        .0
+        .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
+            node_id: 3,
+            term: 1,
+            prev_log_index: 1,
+            success: true,
+        }));
 
+    // Now we should get CommitNotification for entry1
+    let notif = expect_commit_notification(&mut outbound_rx).await;
+    assert_eq!(notif.request, "entry1".as_bytes().to_vec());
+
+    // Leader retries with node 2 after failure
     nodes
         .get(&1)
         .unwrap()
@@ -317,7 +339,7 @@ async fn test_log_replication_with_conflicting_entries() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -326,7 +348,8 @@ async fn test_log_replication_with_conflicting_entries() {
         .recv(Inbound::MakeRequest(MakeRequest {
             request: "leader_entry".as_bytes().to_vec(),
         }));
-    drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    // Collect AppendEntries sent to followers
+    collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
 
     nodes
         .get(&1)
@@ -366,7 +389,7 @@ async fn test_log_replication_exponential_backoff() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     for i in 1..=5 {
         nodes
@@ -376,7 +399,8 @@ async fn test_log_replication_exponential_backoff() {
             .recv(Inbound::MakeRequest(MakeRequest {
                 request: format!("entry_{}", i).as_bytes().to_vec(),
             }));
-        drain_messages(&mut outbound_rx, (num_nodes - 1) as usize).await;
+        // Collect AppendEntries sent to followers for each request
+        collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
     }
 
     nodes
@@ -444,7 +468,7 @@ async fn test_empty_append_entries_heartbeat() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -473,7 +497,7 @@ async fn test_follower_log_truncation_on_conflict() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&2)
@@ -501,6 +525,64 @@ async fn test_follower_log_truncation_on_conflict() {
         assert_eq!(resp.prev_log_index, 1);
     } else {
         panic!("unexpected event: {:?}", event);
+    }
+
+    shutdown_cluster(nodes).await;
+}
+
+#[tokio::test]
+async fn test_leader_handles_concurrent_append_entries_responses() {
+    let num_nodes = 3;
+    let quorum = 2;
+    let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
+
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
+
+    // Send multiple requests quickly
+    for i in 1..=3 {
+        nodes
+            .get(&1)
+            .unwrap()
+            .0
+            .recv(Inbound::MakeRequest(MakeRequest {
+                request: format!("request_{}", i).as_bytes().to_vec(),
+            }));
+    }
+
+    // Collect all AppendEntries messages
+    for _ in 1..=3 {
+        collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
+    }
+
+    // Send responses for all entries from both followers
+    for i in 1..=3 {
+        nodes
+            .get(&1)
+            .unwrap()
+            .0
+            .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
+                node_id: 2,
+                term: 1,
+                prev_log_index: i,
+                success: true,
+            }));
+        nodes
+            .get(&1)
+            .unwrap()
+            .0
+            .recv(Inbound::AppendEntriesResponse(AppendEntriesResponse {
+                node_id: 3,
+                term: 1,
+                prev_log_index: i,
+                success: true,
+            }));
+    }
+
+    // Should get 3 commit notifications
+    for i in 1..=3 {
+        let notif = expect_commit_notification(&mut outbound_rx).await;
+        assert_eq!(notif.index, i);
+        assert_eq!(notif.request, format!("request_{}", i).as_bytes().to_vec());
     }
 
     shutdown_cluster(nodes).await;

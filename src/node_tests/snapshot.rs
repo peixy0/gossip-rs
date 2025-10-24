@@ -8,7 +8,7 @@ async fn test_leader_receives_snapshot_and_compacts_log() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make 5 requests and commit them
     for i in 1..=5 {
@@ -84,7 +84,7 @@ async fn test_follower_installs_snapshot() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     let snapshot_data = b"snapshot_state".to_vec();
     nodes
@@ -133,7 +133,7 @@ async fn test_follower_rejects_snapshot_with_stale_term() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Update follower 2 to term 2
     nodes
@@ -147,7 +147,9 @@ async fn test_follower_rejects_snapshot_with_stale_term() {
             last_log_term: 0,
         }));
 
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect Vote response (follower updates to term 2)
+    let (_peer_id, vote) = expect_vote(&mut outbound_rx).await;
+    assert_eq!(vote.term, 2);
 
     // Follower receives InstallSnapshot with stale term 1
     nodes
@@ -183,7 +185,7 @@ async fn test_leader_processes_snapshot_response() {
     let quorum = 3;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make 11 requests and commit them
     for i in 1..=11 {
@@ -260,7 +262,7 @@ async fn test_non_leader_ignores_snapshot_available() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&2)
@@ -287,7 +289,7 @@ async fn test_snapshot_installation_with_higher_term() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&2)
@@ -301,12 +303,11 @@ async fn test_snapshot_installation_with_higher_term() {
             data: b"snapshot".to_vec(),
         }));
 
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateCommand first
+    let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+    assert!(matches!(event, Outbound::StateUpdateCommand(_)));
 
-    let event = tokio::time::timeout(tokio::time::Duration::from_secs(1), outbound_rx.recv())
-        .await
-        .expect("Should receive response")
-        .expect("Channel should not be closed");
+    let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
 
     if let Outbound::MessageToPeer(_peer_id, Protocol::InstallSnapshotResponse(resp)) = event {
         assert_eq!(resp.term, 3, "Follower should update to term 3");
@@ -323,7 +324,7 @@ async fn test_log_compaction_with_partial_log() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make 10 requests and commit them
     for i in 1..=10 {
@@ -348,8 +349,9 @@ async fn test_log_compaction_with_partial_log() {
             data: b"snapshot_1_to_6".to_vec(),
         }));
 
-    // Drain StateUpdateResponse from the snapshot
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateResponse from the snapshot
+    let resp = expect_state_update_response(&mut outbound_rx).await;
+    assert_eq!(resp.included_index, 6);
 
     nodes
         .get(&1)
@@ -381,7 +383,7 @@ async fn test_snapshot_covering_all_entries() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make 5 requests and commit them
     for i in 1..=5 {
@@ -410,8 +412,9 @@ async fn test_snapshot_covering_all_entries() {
             data: b"full_snapshot".to_vec(),
         }));
 
-    // Drain StateUpdateResponse from the snapshot
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateResponse from the snapshot
+    let resp = expect_state_update_response(&mut outbound_rx).await;
+    assert_eq!(resp.included_index, 5);
 
     nodes
         .get(&1)
@@ -515,7 +518,7 @@ async fn test_follower_snapshot_updates_commit_index() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&2)
@@ -529,8 +532,16 @@ async fn test_follower_snapshot_updates_commit_index() {
             data: b"snapshot".to_vec(),
         }));
 
-    drain_messages(&mut outbound_rx, 1).await;
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateCommand
+    let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+    assert!(matches!(event, Outbound::StateUpdateCommand(_)));
+
+    // Expect InstallSnapshotResponse
+    let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+    assert!(matches!(
+        event,
+        Outbound::MessageToPeer(_, Protocol::InstallSnapshotResponse(_))
+    ));
 
     nodes
         .get(&2)
@@ -601,7 +612,7 @@ async fn test_multiple_snapshots_sequential() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make 10 requests and commit them
     for i in 1..=10 {
@@ -626,8 +637,9 @@ async fn test_multiple_snapshots_sequential() {
             data: b"snapshot_1".to_vec(),
         }));
 
-    // Drain StateUpdateResponse from the first snapshot
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateResponse from the first snapshot
+    let resp = expect_state_update_response(&mut outbound_rx).await;
+    assert_eq!(resp.included_index, 3);
 
     // Make 5 more requests (11-15) and commit them
     for i in 11..=15 {
@@ -652,8 +664,9 @@ async fn test_multiple_snapshots_sequential() {
             data: b"snapshot_2".to_vec(),
         }));
 
-    // Drain StateUpdateResponse from the second snapshot
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateResponse from the second snapshot
+    let resp = expect_state_update_response(&mut outbound_rx).await;
+    assert_eq!(resp.included_index, 8);
 
     nodes
         .get(&1)
@@ -682,7 +695,7 @@ async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
     let quorum = 3;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make 10 requests and commit them
     for i in 1..=10 {
@@ -708,8 +721,9 @@ async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
             data: snapshot_data.clone(),
         }));
 
-    // Drain StateUpdateResponse from the snapshot
-    drain_messages(&mut outbound_rx, 1).await;
+    // Expect StateUpdateResponse from the snapshot
+    let resp = expect_state_update_response(&mut outbound_rx).await;
+    assert_eq!(resp.included_index, 8);
 
     for _ in 0..5 {
         nodes

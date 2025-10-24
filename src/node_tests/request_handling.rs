@@ -9,22 +9,10 @@ async fn test_follower_drops_client_request() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make follower aware of leader
-    nodes
-        .get(&2)
-        .unwrap()
-        .0
-        .recv(Inbound::AppendEntries(AppendEntries {
-            term: 1,
-            leader_id: 1,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        }));
-    let _ = outbound_rx.recv().await;
+    make_follower_aware_of_leader(&nodes, 2, 1, 1, &mut outbound_rx).await;
 
     // Follower receives request - should drop it
     nodes
@@ -45,7 +33,7 @@ async fn test_leader_handles_request_directly() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -100,7 +88,7 @@ async fn test_multiple_concurrent_requests_to_leader() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     for i in 1..=5 {
         nodes
@@ -142,22 +130,10 @@ async fn test_request_during_leader_transition() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     // Make follower aware of leader
-    nodes
-        .get(&2)
-        .unwrap()
-        .0
-        .recv(Inbound::AppendEntries(AppendEntries {
-            term: 1,
-            leader_id: 1,
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: vec![],
-            leader_commit: 0,
-        }));
-    drain_messages(&mut outbound_rx, 1).await;
+    make_follower_aware_of_leader(&nodes, 2, 1, 1, &mut outbound_rx).await;
 
     // Request during transition - follower should drop it
     nodes
@@ -179,7 +155,7 @@ async fn test_request_with_empty_payload() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     nodes
         .get(&1)
@@ -212,7 +188,7 @@ async fn test_large_request_payload() {
     let quorum = 2;
     let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
 
-    elect_leader(&nodes, 1, num_nodes, &mut outbound_rx).await;
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
 
     let large_payload = "x".repeat(10000);
     nodes
@@ -238,6 +214,47 @@ async fn test_large_request_payload() {
         }
     }
     assert!(found);
+
+    shutdown_cluster(nodes).await;
+}
+
+#[tokio::test]
+async fn test_leader_handles_duplicate_requests() {
+    let num_nodes = 3;
+    let quorum = 2;
+    let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
+
+    elect_leader(&nodes, num_nodes, &mut outbound_rx).await;
+
+    let request_data = b"duplicate_request".to_vec();
+
+    // Send the same request multiple times
+    for _ in 0..3 {
+        nodes
+            .get(&1)
+            .unwrap()
+            .0
+            .recv(Inbound::MakeRequest(MakeRequest {
+                request: request_data.clone(),
+            }));
+    }
+
+    // Collect all AppendEntries messages - may be batched or separate
+    let mut total_entries = 0;
+    for _ in 0..3 {
+        let entries = collect_append_entries(&mut outbound_rx, (num_nodes - 1) as usize).await;
+        assert_eq!(entries.len(), 2);
+        for (_peer_id, ae) in entries {
+            total_entries += ae.entries.len();
+            // Each entry should contain the request data
+            for entry in &ae.entries {
+                assert_eq!(entry.request, request_data);
+            }
+        }
+    }
+
+    // Should have received 3 entries total (may be batched differently across followers)
+    assert!(total_entries >= 6); // At least 3 entries per follower
 
     shutdown_cluster(nodes).await;
 }
