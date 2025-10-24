@@ -981,5 +981,8 @@ impl<Provider: DependencyProvider> OnEvent<InstallSnapshotResponse> for Runner<P
         self.next_index
             .insert(event.node_id, self.last_included_index + 1);
         self.maybe_advance_commit_index();
+        let _ = self
+            .internal_tx
+            .send(Inbound::InitiateHeartbeat(InitiateHeartbeat(event.node_id)));
     }
 }

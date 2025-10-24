@@ -8,16 +8,21 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const NUM_NODES: u64 = 5;
 const QUORUM: u64 = (NUM_NODES / 2) + 1;
-const MESSAGE_DROP_PROBABILITY: f64 = 0.33; // 33% chance of dropping a message
-const MAX_MESSAGE_DELAY_MS: u64 = 150; // Max network latency in milliseconds
-const SNAPSHOT_THRESHOLD: u64 = 5;
+const MESSAGE_DROP_PROBABILITY: f64 = 0.33;
+const MAX_MESSAGE_DELAY: tokio::time::Duration = tokio::time::Duration::from_millis(1500);
+const HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(1000);
+const ELECTION_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(3000);
+const REQUEST_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(2000);
+const SNAPSHOT_THRESHOLD: u64 = 10;
 
 /// Configuration for the Raft simulation
 struct SimulationConfig {
     num_nodes: u64,
     quorum: u64,
     message_drop_probability: f64,
-    max_message_delay_ms: u64,
+    max_message_delay: tokio::time::Duration,
+    heatbeat_interval: tokio::time::Duration,
+    election_interval: tokio::time::Duration,
     snapshot_threshold: u64,
 }
 
@@ -27,7 +32,9 @@ impl Default for SimulationConfig {
             num_nodes: NUM_NODES,
             quorum: QUORUM,
             message_drop_probability: MESSAGE_DROP_PROBABILITY,
-            max_message_delay_ms: MAX_MESSAGE_DELAY_MS,
+            max_message_delay: MAX_MESSAGE_DELAY,
+            heatbeat_interval: HEARTBEAT_INTERVAL,
+            election_interval: ELECTION_INTERVAL,
             snapshot_threshold: SNAPSHOT_THRESHOLD,
         }
     }
@@ -84,8 +91,8 @@ impl RaftSimulation {
                 self.network_tx.clone(),
                 timer_service,
                 self.config.quorum,
-                tokio::time::Duration::from_secs(1),
-                tokio::time::Duration::from_secs(3),
+                self.config.heatbeat_interval,
+                self.config.election_interval,
             );
             self.nodes.insert(*node_id, node);
         }
@@ -102,7 +109,7 @@ impl RaftSimulation {
         info!(
             "Network will randomly drop {:.0}% of messages and delay others up to {}ms.",
             self.config.message_drop_probability * 100.0,
-            self.config.max_message_delay_ms
+            self.config.max_message_delay.as_millis(),
         );
         info!("Press Ctrl+C to stop.");
     }
@@ -128,7 +135,7 @@ impl RaftSimulation {
         E: Send + 'static,
     {
         if rand::random_bool(drop_probability) {
-            warn!("[Network] dropping message to node {}", node.get_id());
+            debug!("[Network] dropping message to node {}", node.get_id());
             return;
         }
 
@@ -164,7 +171,7 @@ impl NetworkSimulator {
             self.nodes[leader_id].recv(event);
         } else {
             warn!(
-                "[Network] dropping request {:?}, leader not elected",
+                "[Network] dropping request {}, leader not elected",
                 String::from_utf8(event.request).unwrap()
             );
         }
@@ -179,7 +186,7 @@ impl NetworkSimulator {
     fn handle_message_to_peer(&self, dest_node_id: u64, protocol: Protocol) {
         let node = self.nodes[&dest_node_id].clone();
         let drop_prob = self.config.message_drop_probability;
-        let max_delay = self.config.max_message_delay_ms;
+        let max_delay = self.config.max_message_delay.as_millis() as u64;
 
         match protocol {
             Protocol::RequestPreVote(e) => {
@@ -212,9 +219,10 @@ impl NetworkSimulator {
     /// Handles commit notifications and triggers snapshots when threshold is reached
     fn handle_commit_notification(&mut self, e: CommitNotification) {
         info!(
-            "[Commit] request index {} term {} {}",
-            e.index,
+            "[Commit] node {} committed term {} index {} {}",
+            e.node_id,
             e.term,
+            e.index,
             String::from_utf8(e.request).unwrap()
         );
 
@@ -231,12 +239,13 @@ impl NetworkSimulator {
 
     /// Triggers a snapshot for a specific node
     fn trigger_snapshot(&self, node_id: u64, commit_index: u64) {
-        let snapshot_data = format!("snapshot_up_to_{}", commit_index)
+        let snapshot_data = format!("Snapshot-Up-To-{}", commit_index)
             .as_bytes()
             .to_vec();
 
         info!(
-            "[Compaction] triggering compaction {}",
+            "[Snapshot] node {} triggering compaction {}",
+            node_id,
             String::from_utf8(snapshot_data.clone()).unwrap()
         );
 
@@ -248,15 +257,15 @@ impl NetworkSimulator {
 
     /// Handles state update responses (snapshot creation acknowledgment)
     fn handle_state_update_response(&self, e: StateUpdateResponse) {
-        info!("[Snapshot] snapshot created {:?}", e);
+        info!("[Snapshot] node {} snapshot created", e.node_id);
     }
 
     /// Handles state update commands (snapshot commit)
     fn handle_state_update_command(&self, e: StateUpdateCommand) {
         info!(
-            "[Snapshot] commit snapshot {} {:?}",
+            "[Snapshot] node {} commit snapshot {}",
+            e.node_id,
             String::from_utf8(e.data.clone()).unwrap(),
-            e
         );
     }
 
@@ -290,14 +299,14 @@ impl NetworkSimulator {
 /// Client simulator that periodically sends requests to the cluster
 struct ClientSimulator {
     request_tx: tokio::sync::mpsc::UnboundedSender<MakeRequest>,
-    request_interval_ms: u64,
+    request_interval: tokio::time::Duration,
 }
 
 impl ClientSimulator {
     fn new(request_tx: tokio::sync::mpsc::UnboundedSender<MakeRequest>) -> Self {
         Self {
             request_tx,
-            request_interval_ms: 4000,
+            request_interval: REQUEST_INTERVAL,
         }
     }
 
@@ -305,7 +314,7 @@ impl ClientSimulator {
     async fn run(self) {
         let mut request_id: u64 = 1;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(self.request_interval_ms)).await;
+            tokio::time::sleep(self.request_interval).await;
             info!("[Client] sending request #{}", request_id);
 
             let request = MakeRequest {
