@@ -9,10 +9,10 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 const NUM_NODES: u64 = 5;
 const QUORUM: u64 = (NUM_NODES / 2) + 1;
 const MESSAGE_DROP_PROBABILITY: f64 = 0.33;
-const MAX_MESSAGE_DELAY: tokio::time::Duration = tokio::time::Duration::from_millis(1500);
-const HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(1000);
-const ELECTION_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(3000);
-const REQUEST_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(2000);
+const MAX_MESSAGE_DELAY: tokio::time::Duration = tokio::time::Duration::from_millis(15);
+const HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(10);
+const ELECTION_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(30);
+const REQUEST_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_millis(20);
 const SNAPSHOT_THRESHOLD: u64 = 10;
 
 /// Configuration for the Raft simulation

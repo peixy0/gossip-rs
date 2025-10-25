@@ -739,7 +739,7 @@ impl<Provider: DependencyProvider> OnEvent<Vote> for Runner<Provider> {
 }
 
 impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
-    fn on_event(&mut self, event: AppendEntries) {
+    fn on_event(&mut self, mut event: AppendEntries) {
         debug!("[Node {}] <- {:?}", self.node_id, event);
 
         if event.term < self.current_term {
@@ -772,15 +772,17 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
         }
         self.start_election_timer();
 
-        if event.prev_log_index < self.last_included_index {
+        if event.prev_log_index > self.get_last_log_index() {
             debug!(
-                "[Node {}] rejecting event, prev_log_index {} < last_included_index {}",
-                self.node_id, event.prev_log_index, self.last_included_index
+                "[Node {}] rejecting event, prev_log_index {} > last_log_index {}",
+                self.node_id,
+                event.prev_log_index,
+                self.get_last_log_index()
             );
             let resp = AppendEntriesResponse {
                 node_id: self.node_id,
                 term: self.current_term,
-                prev_log_index: self.last_included_index,
+                prev_log_index: self.get_last_log_index(),
                 success: false,
             };
             self.send_to(event.leader_id, resp);
@@ -796,18 +798,21 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             let resp = AppendEntriesResponse {
                 node_id: self.node_id,
                 term: self.current_term,
-                prev_log_index: event.prev_log_index - 1,
+                prev_log_index: event.prev_log_index,
                 success: false,
             };
             self.send_to(event.leader_id, resp);
             return;
         }
 
-        let truncate_from = (event.prev_log_index - self.last_included_index) as usize;
-        if truncate_from < self.log.len() {
-            self.log.drain(truncate_from..);
+        if event.prev_log_index >= self.last_included_index {
+            let truncate_from = (event.prev_log_index - self.last_included_index) as usize;
+            self.log.truncate(truncate_from);
+            self.log.extend(event.entries);
+        } else {
+            let overlapped = (self.last_included_index - event.prev_log_index) as usize;
+            self.log = event.entries.split_off(overlapped);
         }
-        self.log.extend(event.entries);
 
         self.commit_index = std::cmp::max(self.commit_index, event.leader_commit);
         self.advance_commit_index();
@@ -856,15 +861,15 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntriesResponse> for Runner<Pro
             self.match_index.insert(event.node_id, event.prev_log_index);
             self.maybe_advance_commit_index();
         } else {
-            let backoff = self
-                .next_backoff_index
-                .get(&event.node_id)
-                .unwrap_or(&1)
-                .saturating_mul(2);
-            self.next_backoff_index.insert(event.node_id, backoff);
-            self.next_index.entry(event.node_id).and_modify(|idx| {
-                *idx = idx.checked_sub(backoff).unwrap_or_default().max(1);
-            });
+            let mut next_index = *self.next_index.get(&event.node_id).unwrap_or(&1);
+            if event.prev_log_index + 1 < next_index {
+                next_index = event.prev_log_index + 1;
+            } else {
+                let backoff = *self.next_backoff_index.get(&event.node_id).unwrap_or(&1);
+                next_index = next_index.saturating_sub(backoff).max(1);
+                self.next_backoff_index.insert(event.node_id, backoff);
+            }
+            self.next_index.insert(event.node_id, next_index);
             let _ = self
                 .internal_tx
                 .send(Inbound::InitiateHeartbeat(InitiateHeartbeat(event.node_id)));
@@ -878,7 +883,7 @@ impl<Provider: DependencyProvider> OnEvent<StateUpdateRequest> for Runner<Provid
 
         if event.included_index <= self.last_included_index {
             warn!(
-                "[Node {}] dropping event, included_index {} < last_included_index {}",
+                "[Node {}] dropping event, included_index {} <= last_included_index {}",
                 self.node_id, event.included_index, self.last_included_index
             );
             return;
