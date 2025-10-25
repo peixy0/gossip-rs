@@ -780,7 +780,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             let resp = AppendEntriesResponse {
                 node_id: self.node_id,
                 term: self.current_term,
-                prev_log_index: self.last_included_index + self.log.len() as u64,
+                prev_log_index: self.last_included_index,
                 success: false,
             };
             self.send_to(event.leader_id, resp);
@@ -796,7 +796,7 @@ impl<Provider: DependencyProvider> OnEvent<AppendEntries> for Runner<Provider> {
             let resp = AppendEntriesResponse {
                 node_id: self.node_id,
                 term: self.current_term,
-                prev_log_index: self.last_included_index + self.log.len() as u64,
+                prev_log_index: event.prev_log_index - 1,
                 success: false,
             };
             self.send_to(event.leader_id, resp);
@@ -980,6 +980,7 @@ impl<Provider: DependencyProvider> OnEvent<InstallSnapshotResponse> for Runner<P
             .insert(event.node_id, self.last_included_index);
         self.next_index
             .insert(event.node_id, self.last_included_index + 1);
+        self.next_backoff_index.insert(event.node_id, 1);
         self.maybe_advance_commit_index();
         let _ = self
             .internal_tx

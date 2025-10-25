@@ -587,3 +587,96 @@ async fn test_leader_handles_concurrent_append_entries_responses() {
 
     shutdown_cluster(nodes).await;
 }
+
+#[tokio::test]
+async fn test_follower_preserves_committed_entry_on_conflict() {
+    // This test simulates a key part of the "Leader Safety Property".
+    // A follower has a committed entry and a conflicting uncommitted entry.
+    // A new leader sends AppendEntries that should cause the follower to truncate
+    // its log, but the already-committed entry must be preserved.
+    let num_nodes = 3;
+    let quorum = 2;
+    let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
+
+    // We are testing the logic of a follower, node 2.
+    // First, put node 2's log into a specific state:
+    // Index 1: { term: 1, request: "committed" } (and commit_index is 1)
+    // Index 2: { term: 2, request: "old_uncommitted" }
+    nodes
+        .get(&2)
+        .unwrap()
+        .0
+        .recv(Inbound::AppendEntries(AppendEntries {
+            term: 2,
+            leader_id: 98, // fake old leader
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                LogEntry {
+                    term: 1,
+                    request: b"committed".to_vec(),
+                },
+                LogEntry {
+                    term: 2,
+                    request: b"old_uncommitted".to_vec(),
+                },
+            ],
+            leader_commit: 1, // This tells the follower that index 1 is committed.
+        }));
+
+    // The node will emit both a CommitNotification and an AppendEntriesResponse.
+    // We collect both and don't rely on the order.
+    let mut found_resp = false;
+    for _ in 0..2 {
+        let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+        match event {
+            Outbound::MessageToPeer(_, Protocol::AppendEntriesResponse(resp)) => {
+                assert!(resp.success);
+                assert_eq!(resp.prev_log_index, 2);
+                found_resp = true;
+            }
+            Outbound::CommitNotification(notif) => {
+                assert_eq!(notif.index, 1);
+            }
+            _ => panic!("Unexpected event received: {:?}", event),
+        }
+    }
+    assert!(found_resp, "Did not receive expected AppendEntriesResponse");
+
+    // Now, a new leader (node 99) in term 3 sends AppendEntries.
+    // This new leader's log has the same committed entry at index 1,
+    // but a different entry at index 2. This is a valid scenario in Raft.
+    nodes
+        .get(&2)
+        .unwrap()
+        .0
+        .recv(Inbound::AppendEntries(AppendEntries {
+            term: 3,
+            leader_id: 99,     // fake new leader
+            prev_log_index: 1, // The logs match up to index 1
+            prev_log_term: 1,  // Term of the entry at index 1
+            entries: vec![LogEntry {
+                term: 3,
+                request: b"new_uncommitted".to_vec(),
+            }],
+            leader_commit: 1,
+        }));
+
+    // The follower should find the conflict at index 2, truncate its log to index 1,
+    // and then append the new entry. It should respond with success.
+    let (_, resp2) = expect_append_entries_response(&mut outbound_rx).await;
+    assert!(
+        resp2.success,
+        "Follower should accept new entry after truncating conflicting one"
+    );
+    assert_eq!(
+        resp2.prev_log_index, 2,
+        "Follower's log should now be at index 2 with the new entry"
+    );
+
+    // The verification is indirect: the follower accepted the AppendEntries starting after index 1.
+    // This implies it did not find a mismatch at index 1, meaning the committed entry was preserved.
+    // If it had deleted the entry at index 1, prev_log_index=1 would have failed the consistency check.
+
+    shutdown_cluster(nodes).await;
+}

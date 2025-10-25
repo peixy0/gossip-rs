@@ -285,3 +285,93 @@ async fn test_candidate_receives_vote_with_stale_term() {
 
     shutdown_cluster(nodes).await;
 }
+
+#[tokio::test]
+async fn test_reject_vote_from_stale_candidate() {
+    // This test covers the "Stale Candidate Election Rejection" case from analysis.md.
+    // A node with a more up-to-date log should reject a vote request from a candidate
+    // with a less up-to-date log.
+    let num_nodes = 3;
+    let quorum = 2;
+    let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
+
+    // We'll test node 1's logic.
+    // First, give node 1 a log entry to make it "up-to-date".
+    // We can do this by sending it an AppendEntries from a fictional leader in term 1.
+    nodes
+        .get(&1)
+        .unwrap()
+        .0
+        .recv(Inbound::AppendEntries(AppendEntries {
+            term: 1,
+            leader_id: 99, // some other node
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                request: b"data".to_vec(),
+            }],
+            leader_commit: 1,
+        }));
+    // The node will emit both a CommitNotification and an AppendEntriesResponse.
+    // We collect both and don't rely on the order.
+    let mut found_resp = false;
+    for _ in 0..2 {
+        let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+        match event {
+            Outbound::MessageToPeer(_, Protocol::AppendEntriesResponse(resp)) => {
+                assert!(resp.success);
+                found_resp = true;
+            }
+            Outbound::CommitNotification(_) => {
+                // This is expected, do nothing.
+            }
+            _ => panic!("Unexpected event received: {:?}", event),
+        }
+    }
+    assert!(found_resp, "Did not receive expected AppendEntriesResponse");
+
+    // Now, a stale candidate (node 2) in a new term (term 2) requests a vote from node 1.
+    // Node 2's log is empty (last_log_index: 0, last_log_term: 0).
+    // Node 1's log is at index 1, term 1.
+    // Node 2's log is NOT as up-to-date as node 1's.
+    nodes
+        .get(&1)
+        .unwrap()
+        .0
+        .recv(Inbound::RequestVote(RequestVote {
+            term: 2,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        }));
+
+    // Node 1 should update its term to 2, but REJECT the vote.
+    let (peer_id, vote) = expect_vote(&mut outbound_rx).await;
+    assert_eq!(peer_id, 2);
+    assert!(!vote.granted, "Vote should be rejected due to stale log");
+    assert_eq!(vote.term, 2, "Term should be updated to candidate's term");
+
+    // Let's also test the other condition for up-to-date: same last index, but lower term.
+    // A candidate (node 3) with last_log_index: 1, last_log_term: 0 should also be rejected.
+    nodes
+        .get(&1)
+        .unwrap()
+        .0
+        .recv(Inbound::RequestVote(RequestVote {
+            term: 3, // new term
+            candidate_id: 3,
+            last_log_index: 1,
+            last_log_term: 0, // Stale term for the last log entry
+        }));
+
+    let (peer_id_2, vote_2) = expect_vote(&mut outbound_rx).await;
+    assert_eq!(peer_id_2, 3);
+    assert!(
+        !vote_2.granted,
+        "Vote should be rejected due to stale log term"
+    );
+    assert_eq!(vote_2.term, 3);
+
+    shutdown_cluster(nodes).await;
+}

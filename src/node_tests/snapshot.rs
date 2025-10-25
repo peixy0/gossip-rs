@@ -762,3 +762,75 @@ async fn test_leader_sends_install_snapshot_when_follower_far_behind() {
 
     shutdown_cluster(nodes).await;
 }
+
+#[tokio::test]
+async fn test_follower_handles_append_entries_after_snapshot() {
+    // This test covers the "Snapshot and Log Consistency Edge Cases" from analysis.md.
+    // It ensures a follower that has just installed a snapshot can correctly
+    // process subsequent AppendEntries.
+    let num_nodes = 3;
+    let quorum = 2;
+    let (nodes, mut outbound_rx) = create_cluster(num_nodes, quorum);
+
+    // We are testing the logic of a follower, node 2.
+    // 1. & 2. & 3. The follower receives a snapshot for up to index 10.
+    let snapshot_data = b"snapshot_up_to_10".to_vec();
+    nodes
+        .get(&2)
+        .unwrap()
+        .0
+        .recv(Inbound::InstallSnapshot(InstallSnapshot {
+            term: 1,
+            leader_id: 1,
+            last_included_index: 10,
+            last_included_term: 1,
+            data: snapshot_data.clone(),
+        }));
+
+    // The follower should first emit a command to apply the snapshot state.
+    let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+    if let Outbound::StateUpdateCommand(update) = event {
+        assert_eq!(update.included_index, 10);
+        assert_eq!(update.data, snapshot_data);
+    } else {
+        panic!("Expected StateUpdateCommand, got: {:?}", event);
+    }
+
+    // Then, it should respond to the leader.
+    let event = recv_with_timeout(&mut outbound_rx, tokio::time::Duration::from_secs(1)).await;
+    assert!(matches!(
+        event,
+        Outbound::MessageToPeer(_, Protocol::InstallSnapshotResponse(_))
+    ));
+
+    // 4. Simultaneously, the leader appends a new entry at index 11.
+    // The follower now receives an AppendEntries for index 11.
+    // Its log is now effectively starting from index 10.
+    // So, prev_log_index should be 10.
+    nodes
+        .get(&2)
+        .unwrap()
+        .0
+        .recv(Inbound::AppendEntries(AppendEntries {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 10,
+            prev_log_term: 1,
+            entries: vec![LogEntry {
+                term: 1,
+                request: b"entry_11".to_vec(),
+            }],
+            leader_commit: 10,
+        }));
+
+    // 5. Verify the follower accepts the new entry.
+    let (peer_id, resp) = expect_append_entries_response(&mut outbound_rx).await;
+    assert_eq!(peer_id, 1);
+    assert!(resp.success, "Follower should accept entry after snapshot");
+    assert_eq!(
+        resp.prev_log_index, 11,
+        "Follower's log should advance to index 11"
+    );
+
+    shutdown_cluster(nodes).await;
+}
