@@ -16,6 +16,7 @@ const REQUEST_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_mill
 const SNAPSHOT_THRESHOLD: u64 = 10;
 
 /// Configuration for the Raft simulation
+#[derive(Clone)]
 struct SimulationConfig {
     num_nodes: u64,
     quorum: u64,
@@ -344,7 +345,7 @@ async fn main() {
 
     // Clone nodes for network simulator
     let nodes_clone = simulation.nodes.clone();
-    let config_clone = SimulationConfig::default();
+    let config_clone = simulation.config.clone();
 
     // Spawn network simulator task
     let network_simulator = NetworkSimulator::new(nodes_clone, config_clone);

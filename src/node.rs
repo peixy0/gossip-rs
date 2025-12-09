@@ -937,13 +937,12 @@ impl<Provider: DependencyProvider> OnEvent<InstallSnapshot> for Runner<Provider>
         }
         self.start_election_timer();
 
+        self.last_included_term = event.last_included_term;
+        self.last_included_index = event.last_included_index;
         if self.commit_index < self.last_included_index {
             self.commit_index = self.last_included_index;
             self.last_applied = self.last_included_index;
         }
-
-        self.last_included_term = event.last_included_term;
-        self.last_included_index = event.last_included_index;
         self.snapshot = Some(event.data.clone());
         self.log.clear();
 
